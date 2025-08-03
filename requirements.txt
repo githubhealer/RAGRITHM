@@ -45,4 +45,8 @@ vertexai
 google-api-core
 python-dotenv
 gunicorn
+PyPDF2
+python-docx
+langchain
+langchain-google-vertexai
 
