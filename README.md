@@ -5,7 +5,7 @@
 **Create a Virtual Env**
 
 ```bash
-$ python -m virtualenv .env
+$ python -m venv venv
 ```
 
 **Switch to virtualenv**
@@ -13,13 +13,13 @@ $ python -m virtualenv .env
 - Linux / OSX
 
 ```bash
-$ source .env/scripts/activate
+$ source venv/bin/activate
 ```
 
 - Windows
 
 ```cmd
-.env\Scripts\activate.bat
+venv\Scripts\activate.bat
 ```
 
 **Install Packages**

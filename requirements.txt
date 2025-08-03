@@ -37,3 +37,12 @@ urllib3==2.5.0
 uvicorn==0.35.0
 watchfiles==1.1.0
 websockets==15.0.1
+google-cloud-storage
+google-cloud-aiplatform
+neo4j
+functions-framework
+vertexai
+google-api-core
+python-dotenv
+gunicorn
+
