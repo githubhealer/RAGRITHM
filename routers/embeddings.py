@@ -88,8 +88,8 @@ async def generate_embeddings():
 async def list_available_models():
     """List available embedding models"""
     try:
-        project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'psyched-age-464713-e2')
-        vertexai.init(project=project_id, location="us-central1")
+        project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+        vertexai.init(project=project_id)
 
         models_to_test = [
             "text-embedding-004",
