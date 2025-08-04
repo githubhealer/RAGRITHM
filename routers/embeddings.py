@@ -39,7 +39,7 @@ def store_embeddings(vector, filename, chunk_number):
         bucket_name = os.getenv('GCS_EMBEDDINGS_BUCKET')
         bucket = client.bucket(bucket_name)
         base_name = filename.replace('.txt', '')
-        embedding_name = f"{base_name}_chunk_{chunk_number}_embedding.json"
+        embedding_name = f"{base_name}_embedding.json"
         blob = bucket.blob(embedding_name)
         
         embedding_data = {
@@ -58,31 +58,49 @@ def store_embeddings(vector, filename, chunk_number):
 @router.get("/generate")
 async def generate_embeddings():
     contents = []
-    chunk_counter = 0
     
+    client = storage.Client()
+    bucket_name = os.getenv('GCS_EMBEDDINGS_BUCKET')
+    bucket = client.bucket(bucket_name)
+
     for filename, content in read_blob():
         print(f"Processing file: {filename}, content: {content[:50]}...")
         
+        # Extract chunk number from filename
+        if "_chunk_" in filename:
+            chunk_number = int(filename.split("_chunk_")[1].split(".")[0])
+        else:
+            chunk_number = 0
+            
+        # ✅ FIX: Use filename as base, don't add chunk again
+        base_name = filename.replace('.txt', '')
+        embedding_name = f"{base_name}_embedding.json"  # Simple naming
+        
+        blob = bucket.blob(embedding_name)
+        
+        if blob.exists():
+            print(f"Embedding already exists: {embedding_name}, skipping...")
+            continue
+            
         vector = convert_to_vector(content)
         if vector is not None:
+            # Pass the extracted chunk_number to store function
+            store_embeddings(vector, filename, chunk_number)
             contents.append({
                 "source_file": filename,
-                "chunk_number": chunk_counter,
+                "chunk_number": chunk_number,
                 "embedding": vector
             })
-            store_embeddings(vector, filename, chunk_counter)
-            chunk_counter += 1
             
-            # Sleep to avoid quota limits
             time.sleep(2)
-            print(f"Processed {filename} - chunk {chunk_counter-1}, sleeping 2 seconds...")
+            print(f"NEW embedding created: {embedding_name}, sleeping 2 seconds...")
         else:
             print(f"Failed to generate embedding for {filename}")
     
     return {
-        "total_embeddings": len(contents),
-        "processed_files": chunk_counter,
-        "embeddings": contents
+        "total_new_embeddings": len(contents),
+        "processed_files": len(contents),
+        "newly_created_embeddings": contents
     }
 @router.get("/list_models")
 async def list_available_models():
