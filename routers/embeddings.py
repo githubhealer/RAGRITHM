@@ -126,4 +126,4 @@ async def list_available_models():
         
         return {"available_models": available_models}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e)} 
