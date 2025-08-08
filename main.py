@@ -3,10 +3,8 @@ from routers import blob
 
 app = fastapi.FastAPI()
 
-# Include routers
 app.include_router(blob.router)
 
-# Add direct hackrx route (without /blob prefix)
 @app.post("/hackrx/run")
 async def hackrx_run_direct(request: blob.HackRxRunRequest):
     """Direct HackRx endpoint without /blob prefix"""
