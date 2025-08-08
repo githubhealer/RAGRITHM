@@ -1,11 +1,10 @@
 import fastapi
-from routers import documents, embeddings, query
+from routers import blob , query
 
 app = fastapi.FastAPI()
 
 # Include routers
-app.include_router(documents.router)
-app.include_router(embeddings.router)
+app.include_router(blob.router)
 app.include_router(query.router)
 
 @app.get("/")

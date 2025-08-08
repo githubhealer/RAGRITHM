@@ -128,10 +128,11 @@ def generate_embeddings(text: str) -> Optional[List[float]]:
         import vertexai
         from vertexai.language_models import TextEmbeddingModel
         
-        vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location="us-central1")
-        model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+        vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
+        model = TextEmbeddingModel.from_pretrained("gemini-embedding-001")
         embeddings = model.get_embeddings([text])
         return embeddings[0].values
+        
     except Exception as e:
         print(f"Error generating embeddings: {e}")
         return None
@@ -150,5 +151,5 @@ async def extract_keywords_endpoint(request: QueryRequest):
     
     return KeywordResponse(
         keywords=keywords,
-        embeddings=embeddings
+        embeddings=embeddings[0:3] if embeddings else None
     )

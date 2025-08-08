@@ -70,3 +70,4 @@ python-docx
 langchain
 langchain-google-vertexai
 
+requests==2.31.0
