@@ -1,3 +1,5 @@
+# Document Processing System - Exact Specification Implementation
+
 import requests
 import PyPDF2
 import io
@@ -11,6 +13,7 @@ import dotenv
 from neo4j import GraphDatabase
 from urllib.parse import urlparse
 import time
+import re
 
 dotenv.load_dotenv()
 
@@ -22,21 +25,20 @@ neo4j_driver = GraphDatabase.driver(
     auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
 )
 
-# Global embedding model
+# Global models
 _embedding_model = None
 _chat_model = None
 
 class BlobUrlRequest(BaseModel):
     blob_url: str
 
-class SearchRequest(BaseModel):
-    query: str
-    limit: int = 5
-
 class ChatRequest(BaseModel):
     question: str
-    mode: str = "insurance"
-    limit: int = 3
+    limit: int = 5
+
+class HackRxRunRequest(BaseModel):
+    documents: str  # Single document URL for now
+    questions: list[str]
 
 def get_embedding_model():
     """Get or create embedding model instance"""
@@ -45,25 +47,11 @@ def get_embedding_model():
         try:
             vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
             _embedding_model = TextEmbeddingModel.from_pretrained("gemini-embedding-001")
-            print("Embedding model initialized")
+            print("✅ Embedding model initialized (gemini-embedding-001)")
         except Exception as e:
-            print(f"Error initializing embeddings: {e}")
+            print(f"❌ Error initializing embedding model: {e}")
             return None
     return _embedding_model
-
-def generate_embeddings(text: str):
-    """Generate embeddings for text"""
-    try:
-        model = get_embedding_model()
-        if model is None:
-            return None
-        
-        embeddings = model.get_embeddings([text])
-        return embeddings[0].values
-        
-    except Exception as e:
-        print(f"Error generating embeddings: {e}")
-        return None
 
 def get_chat_model():
     """Get or create chat model instance"""
@@ -71,44 +59,201 @@ def get_chat_model():
     if _chat_model is None:
         try:
             vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
-            _chat_model = GenerativeModel("gemini-2.5-flash-lite")
-            print("Chat model initialized")
+            
+            # Try different model versions in order of preference
+            models_to_try = [
+                "gemini-2.0-flash-exp",
+                "gemini-1.5-flash-002", 
+                "gemini-1.5-flash-001",
+                "gemini-1.5-flash"
+            ]
+            
+            for model_name in models_to_try:
+                try:
+                    _chat_model = GenerativeModel(model_name)
+                    print(f"✅ Chat model initialized ({model_name})")
+                    return _chat_model
+                except Exception as model_error:
+                    print(f"⚠️ Failed to load {model_name}: {model_error}")
+                    continue
+            
+            print("❌ No compatible model found")
+            return None
+            
         except Exception as e:
-            print(f"Error initializing chat model: {e}")
+            print(f"❌ Error initializing chat model: {e}")
             return None
     return _chat_model
 
-def store_in_neo4j(document_name: str, text: str, embeddings: list, file_type: str, blob_url: str):
-    """Store document, text, and embeddings in Neo4j"""
+def extract_pdf_text(blob_url):
+    """Extract text from PDF blob URL"""
+    try:
+        print(f"📄 Downloading PDF from: {blob_url}")
+        response = requests.get(blob_url, timeout=30)
+        response.raise_for_status()
+        
+        pdf_file = io.BytesIO(response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        text = ""
+        for page_num, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            text += page_text + "\n"
+            
+        print(f"📝 Extracted {len(text)} characters from {len(pdf_reader.pages)} pages")
+        return text.strip()
+        
+    except Exception as e:
+        print(f"❌ Error extracting PDF text: {e}")
+        return None
+
+def chunk_text(text, chunk_size=1000, overlap=150):
+    """Split text into overlapping chunks"""
+    chunks = []
+    start = 0
+    
+    while start < len(text):
+        # Calculate end position
+        end = start + chunk_size
+        
+        # If this isn't the last chunk, try to end at a word boundary
+        if end < len(text):
+            # Look for the last space within reasonable distance
+            last_space = text.rfind(' ', start, end)
+            if last_space > start + chunk_size * 0.8:  # Only if we don't lose too much
+                end = last_space
+        
+        chunk = text[start:end].strip()
+        if chunk:  # Only add non-empty chunks
+            chunks.append({
+                'text': chunk,
+                'start_pos': start,
+                'end_pos': end,
+                'chunk_index': len(chunks)
+            })
+        
+        # Move start position for next chunk (with overlap)
+        start = end - overlap
+        
+        # Prevent infinite loop
+        if start >= len(text):
+            break
+    
+    print(f"🔪 Split text into {len(chunks)} chunks (size: {chunk_size}, overlap: {overlap})")
+    return chunks
+
+def generate_embeddings(text, max_retries=3):
+    """Generate embeddings for text using Vertex AI with retry logic for 429 errors"""
+    try:
+        embedding_model = get_embedding_model()
+        if not embedding_model:
+            return None
+        
+        for attempt in range(max_retries):
+            try:
+                # Use the correct method for gemini-embedding-001
+                embeddings = embedding_model.get_embeddings([text])
+                return embeddings[0].values if embeddings else None
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or "quota" in error_str or "rate limit" in error_str:
+                    wait_time = (attempt + 1) * 10  # Exponential backoff: 10s, 20s, 30s
+                    print(f"❌ 429 Quota error on attempt {attempt + 1}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Non-429 error, don't retry
+                    print(f"❌ Non-retryable error generating embeddings: {e}")
+                    return None
+        
+        print(f"❌ Failed to generate embeddings after {max_retries} attempts")
+        return None
+        
+    except Exception as e:
+        print(f"❌ Error generating embeddings: {e}")
+        return None
+
+def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embeddings):
+    """Store document and chunks in Neo4j with proper graph structure"""
     try:
         with neo4j_driver.session() as session:
-            session.run("""
-                MERGE (doc:Document {name: $doc_name})
-                SET doc.file_type = $file_type,
-                    doc.blob_url = $blob_url,
-                    doc.text_length = $text_length,
-                    doc.created_at = datetime(),
-                    doc.full_text = $text,
-                    doc.embedding = $embedding
-            """, doc_name=document_name, file_type=file_type, 
-                blob_url=blob_url, text_length=len(text), 
-                text=text, embedding=embeddings)
+            # First, create the Document node
+            document_result = session.run("""
+                MERGE (d:Document {filename: $filename})
+                SET d.blob_url = $blob_url,
+                    d.full_text_length = $text_length,
+                    d.total_chunks = $total_chunks,
+                    d.created_at = datetime()
+                RETURN d
+            """, 
+            filename=file_name,
+            blob_url=blob_url,
+            text_length=len(full_text),
+            total_chunks=len(chunks_with_embeddings)
+            )
             
-            print(f"✅ Stored document '{document_name}' in Neo4j")
+            document_node = document_result.single()
+            if not document_node:
+                raise Exception("Failed to create Document node")
+            
+            print(f"📊 Created Document node: {file_name}")
+            
+            # Now create Chunk nodes and relationships
+            chunks_created = 0
+            for chunk_data in chunks_with_embeddings:
+                if chunk_data['embedding'] is None:
+                    print(f"⚠️ Skipping chunk {chunk_data['chunk_index']} - no embedding")
+                    continue
+                
+                session.run("""
+                    MATCH (d:Document {filename: $filename})
+                    CREATE (c:Chunk {
+                        text: $text,
+                        embedding: $embedding,
+                        chunk_index: $chunk_index,
+                        start_pos: $start_pos,
+                        end_pos: $end_pos,
+                        text_length: $text_length
+                    })
+                    CREATE (d)-[:HAS_CHUNK]->(c)
+                """,
+                filename=file_name,
+                text=chunk_data['text'],
+                embedding=chunk_data['embedding'],
+                chunk_index=chunk_data['chunk_index'],
+                start_pos=chunk_data['start_pos'],
+                end_pos=chunk_data['end_pos'],
+                text_length=len(chunk_data['text'])
+                )
+                chunks_created += 1
+            
+            print(f"✅ Created {chunks_created} Chunk nodes with HAS_CHUNK relationships")
             return True
             
     except Exception as e:
-        print(f"❌ Error storing in Neo4j: {e}")
+        print(f"❌ Error storing document with chunks: {e}")
         return False
 
-def create_vector_index():
-    """Create vector index in Neo4j for similarity search"""
+@router.post("/setup-neo4j")
+async def setup_neo4j():
+    """Setup Neo4j vector index for chunks"""
     try:
         with neo4j_driver.session() as session:
-            # Create vector index for embeddings - gemini-embedding-001 has 3072 dimensions
+            # Check if index already exists
+            result = session.run("SHOW INDEXES YIELD name WHERE name = 'chunk_embeddings'")
+            existing_index = result.single()
+            
+            if existing_index:
+                print("⚠️ Existing vector index found. Dropping and recreating with correct dimensions...")
+                # Drop the existing index
+                session.run("DROP INDEX chunk_embeddings IF EXISTS")
+                print("🗑️ Dropped old vector index")
+            
+            # Create vector index on Chunk nodes as per specification
             session.run("""
-                CREATE VECTOR INDEX document_embeddings IF NOT EXISTS
-                FOR (d:Document) ON (d.embedding)
+                CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
+                FOR (c:Chunk) ON (c.embedding)
                 OPTIONS {
                     indexConfig: {
                         `vector.dimensions`: 3072,
@@ -116,232 +261,375 @@ def create_vector_index():
                     }
                 }
             """)
-            print("✅ Vector index created")
+            
+            print("✅ Vector index 'chunk_embeddings' created successfully with 3072 dimensions")
+            return {"status": "success", "message": "Vector index 'chunk_embeddings' created successfully with 3072 dimensions"}
             
     except Exception as e:
-        print(f"Error creating vector index: {e}")
+        print(f"❌ Error creating vector index: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create vector index: {str(e)}")
 
-@router.post("/setup-neo4j")
-async def setup_neo4j():
-    """Initialize Neo4j database with vector indexes"""
-    create_vector_index()
-    return {"message": "✅ Neo4j setup completed with vector index"}
-
-@router.post("/reset-index")
-async def reset_vector_index():
-    """Drop and recreate the vector index with correct dimensions"""
-    try:
-        with neo4j_driver.session() as session:
-            # Drop existing index
-            session.run("DROP INDEX document_embeddings IF EXISTS")
-            print("🗑️ Dropped existing index")
-            
-        # Create new index with correct dimensions
-        create_vector_index()
-        return {"message": "✅ Vector index reset with 3072 dimensions for gemini-embedding-001"}
-        
-    except Exception as e:
-        return {"error": f"Failed to reset index: {str(e)}"}
-
-@router.get("/test-neo4j")
-async def test_neo4j():
-    """Test Neo4j connection"""
-    try:
-        with neo4j_driver.session() as session:
-            result = session.run("RETURN 'Neo4j connected!' as message")
-            record = result.single()
-            return {"status": "Connected", "message": record["message"]}
-    except Exception as e:
-        return {"status": "Failed", "error": str(e)}
-
-@router.post("/search")
-async def semantic_search(request: SearchRequest):
+@router.post("/process-blob")
+async def process_blob_document(request: BlobUrlRequest):
     """
-    Semantic search through stored documents using vector similarity
+    Process a blob URL document according to exact specifications:
+    1. Download PDF and extract text
+    2. Split into 1000-char chunks with 150-char overlap
+    3. Generate embeddings for each chunk
+    4. Store in Neo4j with Document->Chunk structure
     """
     try:
-        # Generate embedding for the search query
-        print(f"🔍 Searching for: {request.query}")
-        query_embedding = generate_embeddings(request.query)
+        print(f"🚀 Processing blob document: {request.blob_url}")
         
-        if not query_embedding:
-            return {"error": "Failed to generate query embedding"}
-        
-        with neo4j_driver.session() as session:
-            # Vector similarity search
-            result = session.run("""
-                CALL db.index.vector.queryNodes('document_embeddings', $limit, $query_embedding)
-                YIELD node, score
-                RETURN 
-                    node.name as document_name,
-                    node.file_type as file_type,
-                    node.text_length as text_length,
-                    node.full_text as full_text,
-                    node.blob_url as blob_url,
-                    score
-                ORDER BY score DESC
-            """, limit=request.limit, query_embedding=query_embedding)
-            
-            search_results = []
-            for record in result:
-                search_results.append({
-                    "document_name": record["document_name"],
-                    "file_type": record["file_type"],
-                    "text_length": record["text_length"],
-                    "text_preview": record["full_text"][:300] + "..." if len(record["full_text"]) > 300 else record["full_text"],
-                    "similarity_score": record["score"]
-                })
-        
-        return {
-            "query": request.query,
-            "results_found": len(search_results),
-            "results": search_results
-        }
-        
-    except Exception as e:
-        return {"error": f"Search failed: {str(e)}"}
-
-def extract_pdf_text(pdf_content: bytes) -> str:
-    """Extract text from PDF bytes"""
-    try:
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text.strip()
-    except Exception as e:
-        print(f"Error extracting PDF text: {e}")
-        return ""
-
-@router.post("/extract-text")
-async def extract_text_from_blob(request: BlobUrlRequest):
-    """
-    Extract text content from blob URL
-    """
-    try:
-        print(f"📥 Downloading from: {request.blob_url}")
-        
-        # Download the file
-        response = requests.get(request.blob_url, timeout=30)
-        response.raise_for_status()
-        
-        # Extract text based on content type
-        content_type = response.headers.get('content-type', '').lower()
-        
-        if 'pdf' in content_type or request.blob_url.lower().endswith('.pdf'):
-            extracted_text = extract_pdf_text(response.content)
-            file_type = "pdf"
-        else:
-            extracted_text = response.text
-            file_type = "text"
-        
-        if not extracted_text:
-            return {"error": "Could not extract any text", "file_type": file_type}
-        
-        return {
-            "success": True,
-            "file_type": file_type,
-            "text_length": len(extracted_text),
-            "extracted_text": extracted_text[:20] + "..." if len(extracted_text) > 20 else extracted_text,
-        }
-        
-    except Exception as e:
-        return {"error": f"Failed to process blob URL: {str(e)}"}
-
-@router.post("/extract-text-with-embeddings")
-async def extract_text_with_embeddings(request: BlobUrlRequest):
-    """
-    Extract text content from blob URL and generate embeddings
-    """
-    try:
-        print(f"📥 Downloading from: {request.blob_url}")
-        
-        # Download the file
-        response = requests.get(request.blob_url, timeout=30)
-        response.raise_for_status()
-        
-        # Extract text based on content type
-        content_type = response.headers.get('content-type', '').lower()
-        
-        if 'pdf' in content_type or request.blob_url.lower().endswith('.pdf'):
-            extracted_text = extract_pdf_text(response.content)
-            file_type = "pdf"
-        else:
-            extracted_text = response.text
-            file_type = "text"
-        
-        if not extracted_text:
-            return {"error": "Could not extract any text", "file_type": file_type}
-        
-        # Generate embeddings
-        print("🔄 Generating embeddings...")
-        embeddings = generate_embeddings(extracted_text)
-        
-        # Store in Neo4j
+        # Extract filename from URL
         parsed_url = urlparse(request.blob_url)
-        doc_name = os.path.basename(parsed_url.path) or f"document_{int(time.time())}"
+        file_name = parsed_url.path.split('/')[-1] or "unknown_document.pdf"
         
-        if embeddings:
-            print("💾 Storing in Neo4j...")
-            stored = store_in_neo4j(doc_name, extracted_text, embeddings, file_type, request.blob_url)
-        else:
-            stored = False
+        # Step 1: Download PDF and extract text
+        full_text = extract_pdf_text(request.blob_url)
+        if not full_text:
+            raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
+        
+        # Step 2: Split text into chunks (1000 chars, 150 overlap)
+        chunks = chunk_text(full_text, chunk_size=1000, overlap=150)
+        
+        # Step 3: Generate embeddings for each chunk with robust retry logic
+        print(f"🔢 Generating embeddings for {len(chunks)} chunks...")
+        chunks_with_embeddings = []
+        
+        for i, chunk in enumerate(chunks):
+            print(f"Processing chunk {i+1}/{len(chunks)}")
+            
+            # Try to generate embedding with multiple attempts for this specific chunk
+            embedding = None
+            chunk_attempts = 0
+            max_chunk_attempts = 3
+            
+            while embedding is None and chunk_attempts < max_chunk_attempts:
+                chunk_attempts += 1
+                print(f"  Attempt {chunk_attempts}/{max_chunk_attempts} for chunk {i+1}")
+                
+                # Generate embeddings with retry logic
+                embedding = generate_embeddings(chunk['text'])
+                
+                if embedding is None and chunk_attempts < max_chunk_attempts:
+                    # Wait longer for chunk-level retries
+                    wait_time = 10 + (chunk_attempts * 5)  # 15s, 20s for chunk retries
+                    print(f"  ❌ Chunk {i+1} failed attempt {chunk_attempts}. Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+            
+            if embedding is None:
+                print(f"⚠️ Failed to generate embedding for chunk {i+1} after {max_chunk_attempts} attempts")
+            else:
+                print(f"✅ Successfully processed chunk {i+1}")
+            
+            chunks_with_embeddings.append({
+                'text': chunk['text'],
+                'chunk_index': chunk['chunk_index'],
+                'start_pos': chunk['start_pos'],
+                'end_pos': chunk['end_pos'],
+                'embedding': embedding
+            })
+            
+            # Short delay between chunks to avoid rate limits
+            if i < len(chunks) - 1:  # Don't sleep after the last chunk
+                print(f"⏱️ Waiting 1 second before processing next chunk...")
+                time.sleep(1)
+        
+        # Step 4: Store in Neo4j with proper graph structure
+        success = store_document_with_chunks(file_name, full_text, request.blob_url, chunks_with_embeddings)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to store document in Neo4j")
+        
+        # Count successful embeddings
+        successful_embeddings = sum(1 for chunk in chunks_with_embeddings if chunk['embedding'] is not None)
         
         return {
-            "success": True,
-            "file_type": file_type,
-            "document_name": doc_name,
-            "text_length": len(extracted_text),
-            "extracted_text": extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text,
-            "embeddings": embeddings[:5] if embeddings else None,  # First 5 values
-            "embeddings_length": len(embeddings) if embeddings else 0,
-            "has_embeddings": embeddings is not None,
-            "stored_in_neo4j": stored
+            "status": "success",
+            "message": "Document processed successfully",
+            "filename": file_name,
+            "full_text_length": len(full_text),
+            "total_chunks": len(chunks),
+            "chunks_with_embeddings": successful_embeddings,
+            "blob_url": request.blob_url
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": f"Failed to process blob URL: {str(e)}"}
+        print(f"❌ Error processing blob document: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
 @router.post("/chat")
 async def chat_with_documents(request: ChatRequest):
-    """Chat with your documents using semantic search"""
+    """
+    Chat with documents using chunk-based vector similarity search
+    """
     try:
         print(f"🤖 Processing question: {request.question}")
         
-        # Perform semantic search to find relevant content
-        search_results = await semantic_search(SearchRequest(query=request.question, limit=5))
+        # Step 1: Generate embedding for user question
+        question_embedding = generate_embeddings(request.question)
+        if not question_embedding:
+            raise HTTPException(status_code=500, detail="Failed to generate question embedding")
         
-        if not search_results.get("results"):
-            return {"answer": "I couldn't find any relevant information in your documents to answer that question."}
+        # Step 2: Vector similarity search against chunk_embeddings index
+        with neo4j_driver.session() as session:
+            result = session.run("""
+                CALL db.index.vector.queryNodes('chunk_embeddings', $limit, $question_embedding)
+                YIELD node, score
+                MATCH (d:Document)-[:HAS_CHUNK]->(node)
+                WHERE d.filename IS NOT NULL AND node.text IS NOT NULL
+                RETURN 
+                    node.text as chunk_text,
+                    node.chunk_index as chunk_index,
+                    d.filename as document_name,
+                    score as similarity_score
+                ORDER BY score DESC
+            """, 
+            limit=request.limit, 
+            question_embedding=question_embedding
+            )
+            
+            # Step 3: Construct context from retrieved chunks
+            retrieved_chunks = []
+            context_parts = []
+            
+            for record in result:
+                chunk_info = {
+                    "chunk_text": record["chunk_text"],
+                    "chunk_index": record["chunk_index"],
+                    "document_name": record["document_name"],
+                    "similarity_score": record["similarity_score"]
+                }
+                retrieved_chunks.append(chunk_info)
+                context_parts.append(f"[From {record['document_name']}, Chunk {record['chunk_index']}]: {record['chunk_text']}")
         
-        # Get chat model
+        if not retrieved_chunks:
+            return {
+                "answer": "I couldn't find any relevant information in your documents to answer that question.",
+                "sources": [],
+                "chunks_used": 0
+            }
+        
+        # Step 4: Create detailed prompt for Gemini
+        context_string = "\n\n".join(context_parts)
+        
+        prompt = f"""Based on the following document chunks, please provide a comprehensive answer to the user's question.
+
+DOCUMENT CONTEXT:
+{context_string}
+
+USER QUESTION: {request.question}
+
+Please provide a detailed answer based on the document content above. If the information is not sufficient, please state what additional information would be helpful."""
+        
+        # Step 5: Generate response using Gemini
         chat_model = get_chat_model()
         if not chat_model:
             raise HTTPException(status_code=500, detail="Chat model not available")
         
-        # Prepare context from search results
-        context = ""
-        for i, result in enumerate(search_results["results"], 1):
-            context += f"Document {i} (from {result['document_name']}):\n{result['text_preview']}\n\n"
-        
-        # Create prompt
-        prompt = f"""Based on the following document excerpts, please answer the user's question. If the information isn't available in the documents, say so clearly.
-
-Context from documents:
-{context}
-
-User question: {request.question}
-
-Please provide a helpful, accurate answer based on the document content:"""
-        
-        # Generate response
         response = chat_model.generate_content(prompt)
+        
+        # Prepare source information
+        sources = []
+        for chunk in retrieved_chunks:
+            source_info = {
+                "document_name": chunk["document_name"],
+                "chunk_index": chunk["chunk_index"],
+                "similarity_score": round(chunk["similarity_score"], 4)
+            }
+            if source_info not in sources:  # Avoid duplicates
+                sources.append(source_info)
         
         return {
             "answer": response.text,
-            "sources": [{"document_name": r["document_name"], "similarity": r["similarity_score"]} for r in search_results["results"]]
+            "sources": sources,
+            "chunks_used": len(retrieved_chunks),
+            "question": request.question
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in chat: {e}")
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+
+@router.get("/documents")
+async def list_documents():
+    """List all processed documents with chunk information"""
+    try:
+        with neo4j_driver.session() as session:
+            result = session.run("""
+                MATCH (d:Document)
+                OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+                RETURN 
+                    d.filename as filename,
+                    d.blob_url as blob_url,
+                    d.full_text_length as text_length,
+                    d.total_chunks as total_chunks,
+                    count(c) as chunks_stored,
+                    d.created_at as created_at
+                ORDER BY d.created_at DESC
+            """)
+            
+            documents = []
+            for record in result:
+                documents.append({
+                    "filename": record["filename"],
+                    "blob_url": record["blob_url"],
+                    "text_length": record["text_length"],
+                    "total_chunks": record["total_chunks"],
+                    "chunks_stored": record["chunks_stored"],
+                    "created_at": str(record["created_at"])
+                })
+        
+        return {
+            "status": "success",
+            "documents": documents,
+            "total_documents": len(documents)
         }
         
     except Exception as e:
-        print(f"Error in chat: {e}")
+        print(f"❌ Error listing documents: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/hackrx/run")
+async def hackrx_run(request: HackRxRunRequest):
+    """
+    HackRx endpoint: Process a document and answer multiple questions
+    """
+    try:
+        print(f"🚀 HackRx Run: Processing document and {len(request.questions)} questions")
+        
+        # Step 1: Process the document first
+        blob_request = BlobUrlRequest(blob_url=request.documents)
+        process_result = await process_blob_document(blob_request)
+        
+        if process_result.get("status") != "success":
+            raise HTTPException(status_code=500, detail="Failed to process document")
+        
+        print(f"✅ Document processed: {process_result['filename']}")
+        
+        # Step 2: Answer all questions
+        answers = []
+        
+        for i, question in enumerate(request.questions):
+            print(f"🤖 Answering question {i+1}/{len(request.questions)}: {question[:50]}...")
+            
+            try:
+                # Use the chat function to get answer
+                chat_request = ChatRequest(question=question, limit=3)
+                chat_result = await chat_with_documents(chat_request)
+                
+                # Extract just the answer text
+                answer = chat_result.get("answer", "Could not generate answer for this question.")
+                answers.append(answer)
+                
+                # Small delay between questions to avoid rate limits
+                if i < len(request.questions) - 1:
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                print(f"❌ Error answering question {i+1}: {e}")
+                answers.append(f"Error generating answer: {str(e)}")
+        
+        return {
+            "answers": answers,
+            "document_processed": process_result['filename'],
+            "total_questions": len(request.questions),
+            "total_chunks": process_result.get('total_chunks', 0)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in HackRx run: {e}")
+        raise HTTPException(status_code=500, detail=f"HackRx run failed: {str(e)}")
+
+@router.post("/reset-database")
+async def reset_database():
+    """Complete database reset - removes all documents and chunks"""
+    try:
+        with neo4j_driver.session() as session:
+            # Remove all relationships first
+            result1 = session.run("MATCH ()-[r:HAS_CHUNK]-() DELETE r RETURN count(r) as deleted")
+            deleted_rels = result1.single()["deleted"]
+            
+            # Remove all chunks
+            result2 = session.run("MATCH (c:Chunk) DELETE c RETURN count(c) as deleted")
+            deleted_chunks = result2.single()["deleted"]
+            
+            # Remove all documents
+            result3 = session.run("MATCH (d:Document) DELETE d RETURN count(d) as deleted")
+            deleted_docs = result3.single()["deleted"]
+            
+            return {
+                "status": "success",
+                "message": f"Database reset: {deleted_docs} documents, {deleted_chunks} chunks, {deleted_rels} relationships removed"
+            }
+            
+    except Exception as e:
+        print(f"❌ Error during reset: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/cleanup")
+async def cleanup_database():
+    """Clean up duplicate or corrupted data in Neo4j"""
+    try:
+        with neo4j_driver.session() as session:
+            # First, remove relationships for documents without proper filenames
+            result1 = session.run("""
+                MATCH (d:Document)-[r:HAS_CHUNK]->(c:Chunk) 
+                WHERE d.filename IS NULL 
+                DELETE r, c 
+                RETURN count(r) as deleted_relationships
+            """)
+            deleted_rels = result1.single()["deleted_relationships"]
+            
+            # Then remove documents without proper filenames
+            result2 = session.run("MATCH (d:Document) WHERE d.filename IS NULL DELETE d RETURN count(d) as deleted")
+            deleted_docs = result2.single()["deleted"]
+            
+            # Remove any remaining orphaned chunks
+            result3 = session.run("""
+                MATCH (c:Chunk) 
+                WHERE NOT EXISTS((c)<-[:HAS_CHUNK]-(:Document))
+                DELETE c 
+                RETURN count(c) as deleted
+            """)
+            deleted_chunks = result3.single()["deleted"]
+            
+            return {
+                "status": "success",
+                "message": f"Cleanup completed: {deleted_docs} documents, {deleted_rels} relationships, and {deleted_chunks} orphaned chunks removed"
+            }
+            
+    except Exception as e:
+        print(f"❌ Error during cleanup: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test Neo4j connection
+        with neo4j_driver.session() as session:
+            session.run("RETURN 1")
+        
+        # Test embedding model
+        embedding_model = get_embedding_model()
+        
+        return {
+            "status": "healthy",
+            "neo4j": "connected",
+            "embedding_model": "available" if embedding_model else "unavailable",
+            "vector_index": "check /setup-neo4j to ensure index exists"
+        }
+        
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
