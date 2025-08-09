@@ -24,6 +24,11 @@ async def hackrx_run_direct(request: blob.HackRxRunRequest):
     """Direct HackRx endpoint without /blob prefix"""
     return await blob.hackrx_run(request)
 
+# Alias to match external webhook format requirement
+@app.post("/api/v1/hackrx/run")
+async def hackrx_run_v1(request: blob.HackRxRunRequest):
+    return await blob.hackrx_run(request)
+
 @app.get("/")
 async def read_root():
     return {"message": "Hello, World!"}

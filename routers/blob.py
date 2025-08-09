@@ -243,27 +243,57 @@ async def setup_neo4j():
             # Check if index already exists
             result = session.run("SHOW INDEXES YIELD name WHERE name = 'chunk_embeddings'")
             existing_index = result.single()
-            
             if existing_index:
-                print("⚠️ Existing vector index found. Dropping and recreating with correct dimensions...")
-                # Drop the existing index
+                print("⚠️ Existing vector index found. Dropping before recreate...")
                 session.run("DROP INDEX chunk_embeddings IF EXISTS")
                 print("🗑️ Dropped old vector index")
-            
-            # Create vector index on Chunk nodes as per specification
-            session.run("""
-                CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
-                FOR (c:Chunk) ON (c.embedding)
-                OPTIONS {
-                    indexConfig: {
-                        `vector.dimensions`: 3072,
-                        `vector.similarity_function`: 'cosine'
+
+            # Determine vector dimensions from a sample embedding
+            dims = 3072
+            try:
+                sample = generate_embeddings("vector index setup dimension probe")
+                if sample and isinstance(sample, list):
+                    dims = len(sample)
+                    print(f"ℹ️ Detected embedding dimensions: {dims}")
+                else:
+                    print("ℹ️ Could not detect embedding dimensions, using default 3072")
+            except Exception as dim_err:
+                print(f"⚠️ Dimension detection failed, using default 3072: {dim_err}")
+
+            # Try DDL first
+            try:
+                session.run(
+                    """
+                    CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
+                    FOR (c:Chunk) ON (c.embedding)
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: $dims,
+                            `vector.similarity_function`: 'cosine'
+                        }
                     }
-                }
-            """)
-            
-            print("✅ Vector index 'chunk_embeddings' created successfully with 3072 dimensions")
-            return {"status": "success", "message": "Vector index 'chunk_embeddings' created successfully with 3072 dimensions"}
+                    """
+                , dims=dims)
+                print("✅ Vector index 'chunk_embeddings' created via DDL")
+                return {"status": "success", "message": f"Vector index created via DDL (dims={dims})"}
+            except Exception as ddl_err:
+                print(f"⚠️ DDL vector index creation failed, trying procedure fallback: {ddl_err}")
+
+                # Procedure fallback (works on some Aura/Neo4j versions)
+                try:
+                    session.run(
+                        "CALL db.index.vector.createNodeIndex($name, $label, $prop, $dims, $sim)",
+                        name="chunk_embeddings",
+                        label="Chunk",
+                        prop="embedding",
+                        dims=dims,
+                        sim="cosine",
+                    )
+                    print("✅ Vector index 'chunk_embeddings' created via procedure fallback")
+                    return {"status": "success", "message": f"Vector index created via procedure fallback (dims={dims})"}
+                except Exception as proc_err:
+                    print(f"❌ Procedure fallback failed: {proc_err}")
+                    raise HTTPException(status_code=500, detail=f"Failed to create vector index (DDL and procedure): {proc_err}")
             
     except Exception as e:
         print(f"❌ Error creating vector index: {e}")
@@ -617,6 +647,8 @@ async def health_check():
         # Test Neo4j connection
         with neo4j_driver.session() as session:
             session.run("RETURN 1")
+            idx = session.run("SHOW INDEXES YIELD name WHERE name = 'chunk_embeddings'").single()
+            vector_index_status = "present" if idx else "absent"
         
         # Test embedding model
         embedding_model = get_embedding_model()
@@ -625,7 +657,7 @@ async def health_check():
             "status": "healthy",
             "neo4j": "connected",
             "embedding_model": "available" if embedding_model else "unavailable",
-            "vector_index": "check /setup-neo4j to ensure index exists"
+            "vector_index": vector_index_status
         }
         
     except Exception as e:

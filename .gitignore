@@ -58,6 +58,12 @@ frontend/dist/
 # Credentials/Keys (adjust patterns as needed)
 # Service account keys should never be committed
 psyched-age-*.json
+*.json
+!package*.json
+!tsconfig*.json
+!.vscode/*.json
+!frontend/package*.json
+!frontend/tsconfig*.json
 # If you store credentials under gcp/, ignore all JSON there
 /gcp/*.json
 
