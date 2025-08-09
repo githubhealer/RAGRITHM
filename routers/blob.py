@@ -3,7 +3,7 @@
 import requests
 import PyPDF2
 import io
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
@@ -11,9 +11,13 @@ from vertexai.generative_models import GenerativeModel
 import os
 import dotenv
 from neo4j import GraphDatabase
+from neo4j.exceptions import ClientError
 from urllib.parse import urlparse
 import time
 import re
+import uuid
+import asyncio
+from typing import Dict, Any
 
 dotenv.load_dotenv()
 
@@ -25,9 +29,24 @@ neo4j_driver = GraphDatabase.driver(
     auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
 )
 
+# Neo4j vector index configuration
+INDEX_NAME = os.getenv("NEO4J_VECTOR_INDEX", "chunk_embeddings")
+INDEX_PROP = os.getenv("NEO4J_VECTOR_PROPERTY", "embedding")
+NEO4J_DB = os.getenv("NEO4J_DATABASE")  # optional; Aura often uses 'neo4j'
+DEFAULT_DIMS = int(os.getenv("EMBEDDING_DIMS", "3072"))
+
 # Global models
 _embedding_model = None
 _chat_model = None
+
+# In-memory progress tracking for long-running jobs (ephemeral per instance)
+_jobs: Dict[str, Dict[str, Any]] = {}
+
+def _set_progress(job_id: str, **kwargs):
+    job = _jobs.get(job_id, {})
+    job.update(kwargs)
+    job["updated_at"] = time.time()
+    _jobs[job_id] = job
 
 class BlobUrlRequest(BaseModel):
     blob_url: str
@@ -39,6 +58,62 @@ class ChatRequest(BaseModel):
 class HackRxRunRequest(BaseModel):
     documents: str  # Single document URL for now
     questions: list[str]
+
+class HackRxJobStartResponse(BaseModel):
+    job_id: str
+    status_url: str
+
+
+def _neo4j_session():
+    """Helper to open a session, honoring optional database name."""
+    if NEO4J_DB:
+        return neo4j_driver.session(database=NEO4J_DB)
+    return neo4j_driver.session()
+
+
+def _index_exists(session) -> bool:
+    res = session.run("SHOW INDEXES YIELD name WHERE name = $name RETURN name", name=INDEX_NAME)
+    return res.single() is not None
+
+
+def _try_create_index(session, dims: int) -> str | None:
+    """Try DDL first, then procedure. Return the method used or None if failed."""
+    # DDL
+    try:
+        session.run(
+            f"""
+            CREATE VECTOR INDEX {INDEX_NAME} IF NOT EXISTS
+            FOR (c:Chunk) ON (c.{INDEX_PROP})
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: $dims,
+                    `vector.similarity_function`: 'cosine'
+                }}
+            }}
+            """,
+            dims=dims,
+        ).consume()
+        return "ddl"
+    except ClientError as e:
+        # Fall through to procedure
+        print(f"⚠️ DDL create failed: {e}")
+    except Exception as e:
+        print(f"⚠️ DDL create error: {e}")
+
+    # Procedure
+    try:
+        session.run(
+            "CALL db.index.vector.createNodeIndex($name,'Chunk',$prop,$dims,'cosine')",
+            name=INDEX_NAME,
+            prop=INDEX_PROP,
+            dims=dims,
+        ).consume()
+        return "procedure"
+    except ClientError as e:
+        print(f"⚠️ Procedure create failed: {e}")
+    except Exception as e:
+        print(f"⚠️ Procedure create error: {e}")
+    return None
 
 def get_embedding_model():
     """Get or create embedding model instance"""
@@ -235,69 +310,104 @@ def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embed
         print(f"❌ Error storing document with chunks: {e}")
         return False
 
-@router.post("/setup-neo4j")
-async def setup_neo4j():
-    """Setup Neo4j vector index for chunks"""
+async def _async_hackrx_job(job_id: str, documents: str, questions: list[str]):
+    """Background job that processes a document and answers questions, updating progress."""
     try:
-        with neo4j_driver.session() as session:
-            # Check if index already exists
-            result = session.run("SHOW INDEXES YIELD name WHERE name = 'chunk_embeddings'")
-            existing_index = result.single()
-            if existing_index:
-                print("⚠️ Existing vector index found. Dropping before recreate...")
-                session.run("DROP INDEX chunk_embeddings IF EXISTS")
+        _set_progress(job_id, status="running", percent=1, stage="starting")
+
+        # Step 1: Process the document
+        _set_progress(job_id, percent=10, stage="processing_document")
+        blob_request = BlobUrlRequest(blob_url=documents)
+        process_result = await process_blob_document(blob_request)
+        _set_progress(job_id, percent=60, stage="document_processed", doc=process_result.get("filename"))
+
+        # Step 2: Answer all questions
+        answers: list[str] = []
+        total = max(1, len(questions))
+        for i, question in enumerate(questions):
+            _set_progress(job_id, percent=60 + int((i / total) * 40), stage="answering", current=i+1, total=total)
+            chat_request = ChatRequest(question=question, limit=3)
+            chat_result = await chat_with_documents(chat_request)
+            answers.append(chat_result.get("answer", ""))
+            await asyncio.sleep(0)  # yield control
+
+        result = {
+            "answers": answers,
+            "document_processed": process_result.get("filename"),
+            "total_questions": len(questions),
+            "total_chunks": process_result.get("total_chunks", 0)
+        }
+        _set_progress(job_id, status="completed", percent=100, stage="done", result=result)
+
+    except Exception as e:
+        _set_progress(job_id, status="failed", percent=100, stage="error", error=str(e))
+
+def _run_hackrx_job(job_id: str, payload: dict):
+    """Run the async job in a fresh event loop (for BackgroundTasks)."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_async_hackrx_job(job_id, payload["documents"], payload["questions"]))
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+def _setup_neo4j_core(force: bool = False):
+    """Core logic to ensure the vector index exists. Returns a status dict."""
+    try:
+        with _neo4j_session() as session:
+            if _index_exists(session):
+                if not force:
+                    return {"ok": True, "index": INDEX_NAME, "present": True, "message": "Index already exists"}
+                # Drop then recreate
+                print("⚠️ Force requested. Dropping existing index before recreate…")
+                session.run(f"DROP INDEX {INDEX_NAME} IF EXISTS").consume()
                 print("🗑️ Dropped old vector index")
 
-            # Determine vector dimensions from a sample embedding
-            dims = 3072
+            # Determine dimensions via sample embedding
+            dims_probe = DEFAULT_DIMS
             try:
                 sample = generate_embeddings("vector index setup dimension probe")
                 if sample and isinstance(sample, list):
-                    dims = len(sample)
-                    print(f"ℹ️ Detected embedding dimensions: {dims}")
+                    dims_probe = len(sample)
+                    print(f"ℹ️ Detected embedding dimensions: {dims_probe}")
                 else:
-                    print("ℹ️ Could not detect embedding dimensions, using default 3072")
+                    print(f"ℹ️ Could not detect embedding dimensions, using default {DEFAULT_DIMS}")
             except Exception as dim_err:
-                print(f"⚠️ Dimension detection failed, using default 3072: {dim_err}")
+                print(f"⚠️ Dimension detection failed, using default {DEFAULT_DIMS}: {dim_err}")
 
-            # Try DDL first
-            try:
-                session.run(
-                    """
-                    CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
-                    FOR (c:Chunk) ON (c.embedding)
-                    OPTIONS {
-                        indexConfig: {
-                            `vector.dimensions`: $dims,
-                            `vector.similarity_function`: 'cosine'
-                        }
-                    }
-                    """
-                , dims=dims)
-                print("✅ Vector index 'chunk_embeddings' created via DDL")
-                return {"status": "success", "message": f"Vector index created via DDL (dims={dims})"}
-            except Exception as ddl_err:
-                print(f"⚠️ DDL vector index creation failed, trying procedure fallback: {ddl_err}")
+            dims_candidates = [dims_probe]
+            if 768 not in dims_candidates:
+                dims_candidates.append(768)
 
-                # Procedure fallback (works on some Aura/Neo4j versions)
-                try:
-                    session.run(
-                        "CALL db.index.vector.createNodeIndex($name, $label, $prop, $dims, $sim)",
-                        name="chunk_embeddings",
-                        label="Chunk",
-                        prop="embedding",
-                        dims=dims,
-                        sim="cosine",
-                    )
-                    print("✅ Vector index 'chunk_embeddings' created via procedure fallback")
-                    return {"status": "success", "message": f"Vector index created via procedure fallback (dims={dims})"}
-                except Exception as proc_err:
-                    print(f"❌ Procedure fallback failed: {proc_err}")
-                    raise HTTPException(status_code=500, detail=f"Failed to create vector index (DDL and procedure): {proc_err}")
-            
+            last_err = None
+            for dims in dims_candidates:
+                method = _try_create_index(session, dims)
+                if method and _index_exists(session):
+                    print(f"✅ Vector index '{INDEX_NAME}' created via {method} (dims={dims})")
+                    return {"ok": True, "index": INDEX_NAME, "present": True, "created_with": method, "dims": dims}
+                last_err = f"creation failed for dims={dims}"
+
+            raise HTTPException(status_code=500, detail={"message": "Failed to create vector index", "last_error": last_err})
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Error creating vector index: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create vector index: {str(e)}")
+
+
+@router.post("/setup-neo4j")
+async def setup_neo4j(force: bool = False):
+    """Setup/verify Neo4j vector index for chunks. Use force=true to drop and recreate."""
+    return _setup_neo4j_core(force)
+
+
+@router.get("/setup-neo4j")
+async def setup_neo4j_get(force: bool = False):
+    """GET alias for setup; safe by default (no drop)."""
+    return _setup_neo4j_core(force)
 
 @router.post("/process-blob")
 async def process_blob_document(request: BlobUrlRequest):
@@ -640,14 +750,36 @@ async def cleanup_database():
         print(f"❌ Error during cleanup: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/hackrx/run-async", response_model=HackRxJobStartResponse)
+async def hackrx_run_async(request: HackRxRunRequest, background_tasks: BackgroundTasks):
+    """Start HackRx run in the background and return a job id for progress polling."""
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "status": "queued",
+        "percent": 0,
+        "stage": "queued",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    background_tasks.add_task(_run_hackrx_job, job_id, request.model_dump())
+    return HackRxJobStartResponse(job_id=job_id, status_url=f"/blob/hackrx/status/{job_id}")
+
+@router.get("/hackrx/status/{job_id}")
+async def hackrx_status(job_id: str):
+    """Get status/progress for a background HackRx job."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
 @router.get("/health")
 async def health_check():
     """Health check endpoint"""
     try:
         # Test Neo4j connection
-        with neo4j_driver.session() as session:
+        with _neo4j_session() as session:
             session.run("RETURN 1")
-            idx = session.run("SHOW INDEXES YIELD name WHERE name = 'chunk_embeddings'").single()
+            idx = session.run("SHOW INDEXES YIELD name WHERE name = $name", name=INDEX_NAME).single()
             vector_index_status = "present" if idx else "absent"
         
         # Test embedding model
