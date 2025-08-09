@@ -1,13 +1,72 @@
-.env
-.venv
-venv
+# OS/Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.so
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage*
 *.sqlite3
 *.db
-.DS_Store
+
+# Environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+
+# Builds/Dist
+build/
+dist/
+.eggs/
+*.egg-info/
+.wheels/
+
+# Logs
 *.log
-psyched-age-464713-e2-b5dace742591.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.eslintcache
+.stylelintcache
+.parcel-cache/
+
+# Docker/CI
+.docker/
+.build/
+
+# Credentials/Keys (adjust patterns as needed)
+# Service account keys should never be committed
+psyched-age-*.json
+# If you store credentials under gcp/, ignore all JSON there
+/gcp/*.json
+
+# Neo4j local volumes (if used outside docker-compose)
+neo4j/data/
+neo4j/logs/
+neo4j/import/
+neo4j/plugins/
+
+# Documents (optional; comment out to track)
 documents/
+documents/*.pdf

@@ -33,3 +33,24 @@ $ pip install -r requirements.txt
 ```bash
 $ fastapi dev main.py
 ```
+
+## Frontend (React + Vite)
+
+A minimal UI is provided in `frontend/` to interact with the API.
+
+1. Install Node.js 18+.
+2. Install deps and run the dev server:
+
+```bash
+# from the project root
+cd frontend
+npm install
+npm run dev
+```
+
+The app runs on http://localhost:5173 and expects the API at http://localhost:8000.
+You can override the API base by creating `frontend/.env` with:
+
+```ini
+VITE_API_BASE=http://localhost:8000
+```
