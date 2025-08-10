@@ -211,7 +211,7 @@ def get_chat_model():
             
             # Try different model versions in order of preference
             models_to_try = [
-                "gemini-2.5-flash-exp"
+                "gemini-2.5-flash-lite"
             ]
             
             for model_name in models_to_try:
