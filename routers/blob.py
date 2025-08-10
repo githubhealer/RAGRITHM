@@ -3,7 +3,7 @@
 import requests
 import PyPDF2
 import io
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Header
 from pydantic import BaseModel
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
@@ -11,21 +11,36 @@ from vertexai.generative_models import GenerativeModel
 import os
 import dotenv
 from neo4j import GraphDatabase
-from neo4j.exceptions import ClientError
+from neo4j.exceptions import ClientError, ServiceUnavailable, SessionExpired
 from urllib.parse import urlparse
 import time
 import re
 import uuid
 import asyncio
 from typing import Dict, Any
+import random
+
+try:
+    from google.api_core.exceptions import ResourceExhausted, TooManyRequests  # type: ignore
+except Exception:  # pragma: no cover
+    ResourceExhausted = TooManyRequests = Exception
 
 dotenv.load_dotenv()
 
 router = APIRouter(prefix="/blob")
 
+def _normalize_neo4j_uri(uri: str | None) -> str | None:
+    if not uri:
+        return uri
+    # For Aura (neo4j.io), enforce encrypted scheme
+    if "neo4j.io" in uri and "+s" not in uri:
+        uri = uri.replace("neo4j://", "neo4j+s://").replace("bolt://", "bolt+s://")
+    return uri
+
 # Neo4j connection
+NEO4J_URI = _normalize_neo4j_uri(os.getenv("NEO4J_URI"))
 neo4j_driver = GraphDatabase.driver(
-    os.getenv("NEO4J_URI"),
+    NEO4J_URI,
     auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
 )
 
@@ -33,10 +48,20 @@ neo4j_driver = GraphDatabase.driver(
 INDEX_NAME = os.getenv("NEO4J_VECTOR_INDEX", "chunk_embeddings")
 INDEX_PROP = os.getenv("NEO4J_VECTOR_PROPERTY", "embedding")
 NEO4J_DB = os.getenv("NEO4J_DATABASE")  # optional; Aura often uses 'neo4j'
-DEFAULT_DIMS = int(os.getenv("EMBEDDING_DIMS", "3072"))
+DEFAULT_DIMS = int(os.getenv("EMBEDDING_DIMS", "768"))
+
+# Embedding configuration
+EMBEDDING_TARGET_DIMS = int(os.getenv("EMBEDDING_TARGET_DIMS", str(DEFAULT_DIMS)))  # enforce 768 by default
+EMBEDDING_MODELS = [
+    m.strip() for m in os.getenv(
+        "EMBEDDING_MODELS",
+        "text-embedding-004,text-embedding-005,text-multilingual-embedding-002"
+    ).split(",") if m.strip()
+]
 
 # Global models
-_embedding_model = None
+_embedding_model = None  # retained for health check compatibility
+_embedding_clients: Dict[str, TextEmbeddingModel] = {}
 _chat_model = None
 
 # In-memory progress tracking for long-running jobs (ephemeral per instance)
@@ -64,11 +89,42 @@ class HackRxJobStartResponse(BaseModel):
     status_url: str
 
 
+# --- Simple Bearer token auth dependency ---
+def require_bearer_token(authorization: str | None = Header(default=None)):
+    expected = os.getenv("API_BEARER_TOKEN", "").strip()
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing or invalid authorization header")
+    token = authorization.split(" ", 1)[1].strip()
+    # If expected token is configured, enforce exact match
+    if expected:
+        if token != expected:
+            raise HTTPException(status_code=401, detail="invalid token")
+    # If expected is empty, accept any non-empty bearer token
+    return True
+
+
 def _neo4j_session():
     """Helper to open a session, honoring optional database name."""
     if NEO4J_DB:
         return neo4j_driver.session(database=NEO4J_DB)
     return neo4j_driver.session()
+
+
+def _clean_answer_text(text: str) -> str:
+    """Normalize model output to a single-line plain sentence without bullets or markdown."""
+    if not text:
+        return ""
+    # Replace line breaks with spaces
+    cleaned = re.sub(r"[\r\n]+", " ", text)
+    # Remove common markdown/list markers and excessive punctuation spacing
+    cleaned = re.sub(r"\s*([*•\-]+)\s+", " ", cleaned)
+    # Remove ordered list markers like "1. ", "2) " at word boundaries
+    cleaned = re.sub(r"(?:(?<=\s)|^)(\d+\.|\d+\))\s+", "", cleaned)
+    # Strip backticks and hash headers
+    cleaned = cleaned.replace("`", "").replace("#", "")
+    # Collapse multiple spaces
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
 
 
 def _index_exists(session) -> bool:
@@ -115,17 +171,35 @@ def _try_create_index(session, dims: int) -> str | None:
         print(f"⚠️ Procedure create error: {e}")
     return None
 
+def _init_vertex_if_needed():
+    try:
+        vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
+    except Exception as e:
+        print(f"⚠️ Vertex init warning: {e}")
+
+
+def _get_embedding_client(model_name: str) -> TextEmbeddingModel | None:
+    global _embedding_clients
+    if model_name in _embedding_clients:
+        return _embedding_clients[model_name]
+    try:
+        _init_vertex_if_needed()
+        client = TextEmbeddingModel.from_pretrained(model_name)
+        _embedding_clients[model_name] = client
+        print(f"✅ Embedding client ready ({model_name})")
+        return client
+    except Exception as e:
+        print(f"❌ Failed to init embedding client {model_name}: {e}")
+        return None
+
+
 def get_embedding_model():
-    """Get or create embedding model instance"""
+    """Legacy getter for health check; prefers first configured model."""
     global _embedding_model
     if _embedding_model is None:
-        try:
-            vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
-            _embedding_model = TextEmbeddingModel.from_pretrained("gemini-embedding-001")
-            print("✅ Embedding model initialized (gemini-embedding-001)")
-        except Exception as e:
-            print(f"❌ Error initializing embedding model: {e}")
-            return None
+        # Try to create a client for the first configured model to mark 'available'
+        client = _get_embedding_client(EMBEDDING_MODELS[0] if EMBEDDING_MODELS else "gemini-embedding-001")
+        _embedding_model = client
     return _embedding_model
 
 def get_chat_model():
@@ -137,10 +211,7 @@ def get_chat_model():
             
             # Try different model versions in order of preference
             models_to_try = [
-                "gemini-2.0-flash-exp",
-                "gemini-1.5-flash-002", 
-                "gemini-1.5-flash-001",
-                "gemini-1.5-flash"
+                "gemini-2.5-flash-exp"
             ]
             
             for model_name in models_to_try:
@@ -217,34 +288,120 @@ def chunk_text(text, chunk_size=1000, overlap=150):
     print(f"🔪 Split text into {len(chunks)} chunks (size: {chunk_size}, overlap: {overlap})")
     return chunks
 
-def generate_embeddings(text, max_retries=3):
-    """Generate embeddings for text using Vertex AI with retry logic for 429 errors"""
+def _get_tokenizer():
+    """Lazy-import tiktoken tokenizer; fall back to whitespace if unavailable."""
     try:
-        embedding_model = get_embedding_model()
-        if not embedding_model:
-            return None
-        
-        for attempt in range(max_retries):
-            try:
-                # Use the correct method for gemini-embedding-001
-                embeddings = embedding_model.get_embeddings([text])
-                return embeddings[0].values if embeddings else None
-                
-            except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "quota" in error_str or "rate limit" in error_str:
-                    wait_time = (attempt + 1) * 10  # Exponential backoff: 10s, 20s, 30s
-                    print(f"❌ 429 Quota error on attempt {attempt + 1}. Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    # Non-429 error, don't retry
-                    print(f"❌ Non-retryable error generating embeddings: {e}")
-                    return None
-        
-        print(f"❌ Failed to generate embeddings after {max_retries} attempts")
+        import tiktoken  # type: ignore
+        enc = tiktoken.get_encoding("cl100k_base")
+        return enc
+    except Exception:
         return None
-        
+
+
+def chunk_text_tokens(text: str, chunk_tokens: int = None, overlap_tokens: int = None):
+    """Split text into token-based overlapping chunks.    """
+    if chunk_tokens is None:
+        chunk_tokens = int(os.getenv("CHUNK_TOKENS", "2900"))
+    if overlap_tokens is None:
+        overlap_tokens = int(os.getenv("OVERLAP_TOKENS", "150"))
+
+    enc = _get_tokenizer()
+    if enc is None:
+        # Fallback to character-based splitter
+        print("⚠️ Tokenizer not available; using character-based splitting")
+        return chunk_text(text, chunk_size=chunk_tokens * 4, overlap=overlap_tokens * 4)
+
+    tokens = enc.encode(text)
+    chunks = []
+    start = 0
+    idx = 0
+    n = len(tokens)
+    while start < n:
+        end = min(n, start + chunk_tokens)
+        token_slice = tokens[start:end]
+        chunk_str = enc.decode(token_slice)
+        if chunk_str.strip():
+            chunks.append({
+                'text': chunk_str.strip(),
+                'start_pos': start,  # token index
+                'end_pos': end,      # token index
+                'chunk_index': idx
+            })
+            idx += 1
+        if end >= n:
+            break
+        start = end - overlap_tokens
+        if start < 0:
+            start = 0
+    print(f"🔪 Split text into {len(chunks)} token-chunks (tokens: {chunk_tokens}, overlap: {overlap_tokens})")
+    return chunks
+
+def _is_rate_limit_error(err: Exception) -> bool:
+    s = str(err).lower()
+    return (
+        isinstance(err, (ResourceExhausted, TooManyRequests))
+        or "429" in s
+        or "rate limit" in s
+        or "quota" in s
+        or "resource has been exhausted" in s
+    )
+
+
+def _truncate_or_pad(vec: list[float], target: int) -> list[float]:
+    if len(vec) == target:
+        return vec
+    if len(vec) > target:
+        return vec[:target]
+    return vec + [0.0] * (target - len(vec))
+
+
+def embed_text(text, max_retries=5):
+    if not text:
+        return None
+    models = EMBEDDING_MODELS if EMBEDDING_MODELS else ["text-embedding-004", "gemini-embedding-001"]
+    mcount = len(models)
+    last_err = None
+    start_idx = 0
+    for attempt in range(1, max_retries + 1):
+        # Try a full round of all models before backing off
+        for step in range(mcount):
+            model_name = models[(start_idx + step) % mcount]
+            client = _get_embedding_client(model_name)
+            if client is None:
+                last_err = RuntimeError(f"embedding client unavailable: {model_name}")
+                continue
+            try:
+                if model_name == "text-embedding-004":
+                    res = client.get_embeddings([text], output_dimensionality=EMBEDDING_TARGET_DIMS)
+                else:
+                    res = client.get_embeddings([text])
+                if not res:
+                    raise RuntimeError("empty embedding result")
+                vec = list(res[0].values)
+                vec = _truncate_or_pad(vec, EMBEDDING_TARGET_DIMS)
+                return vec
+            except Exception as e:
+                last_err = e
+                if _is_rate_limit_error(e):
+                    print(f"⚠️ Rate limited on {model_name}. Trying next model immediately (attempt {attempt}/{max_retries}).")
+                    continue  # move to next model without delay
+                else:
+                    print(f"⚠️ Embedding error on {model_name}: {e}. Trying next model.")
+                    continue
+
+        # After a full round, backoff with jitter and rotate the start index
+        if attempt < max_retries:
+            base = 2 ** (attempt - 1)
+            time.sleep(base + random.uniform(0, 0.5))
+            start_idx = (start_idx + 1) % mcount
+    print(f"❌ Failed to embed after {max_retries} attempts. Last error: {last_err}")
+    return None
+
+
+def generate_embeddings(text, max_retries=5):
+    """Generate 768-dim embeddings with alternation and truncation/padding."""
+    try:
+        return embed_text(text, max_retries=max_retries)
     except Exception as e:
         print(f"❌ Error generating embeddings: {e}")
         return None
@@ -253,56 +410,63 @@ def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embed
     """Store document and chunks in Neo4j with proper graph structure"""
     try:
         with neo4j_driver.session() as session:
-            # First, create the Document node
-            document_result = session.run("""
-                MERGE (d:Document {filename: $filename})
-                SET d.blob_url = $blob_url,
-                    d.full_text_length = $text_length,
-                    d.total_chunks = $total_chunks,
-                    d.created_at = datetime()
-                RETURN d
-            """, 
-            filename=file_name,
-            blob_url=blob_url,
-            text_length=len(full_text),
-            total_chunks=len(chunks_with_embeddings)
-            )
-            
-            document_node = document_result.single()
+            # First, create the Document node (retryable via execute_write)
+            def _create_doc(tx):
+                return tx.run(
+                    """
+                    MERGE (d:Document {filename: $filename})
+                    SET d.blob_url = $blob_url,
+                        d.full_text_length = $text_length,
+                        d.total_chunks = $total_chunks,
+                        d.created_at = coalesce(d.created_at, datetime())
+                    RETURN d
+                    """,
+                    filename=file_name,
+                    blob_url=blob_url,
+                    text_length=len(full_text),
+                    total_chunks=len(chunks_with_embeddings)
+                ).single()
+
+            document_node = session.execute_write(_create_doc)
             if not document_node:
                 raise Exception("Failed to create Document node")
-            
+
             print(f"📊 Created Document node: {file_name}")
-            
+
             # Now create Chunk nodes and relationships
             chunks_created = 0
             for chunk_data in chunks_with_embeddings:
                 if chunk_data['embedding'] is None:
                     print(f"⚠️ Skipping chunk {chunk_data['chunk_index']} - no embedding")
                     continue
-                
-                session.run("""
-                    MATCH (d:Document {filename: $filename})
-                    CREATE (c:Chunk {
-                        text: $text,
-                        embedding: $embedding,
-                        chunk_index: $chunk_index,
-                        start_pos: $start_pos,
-                        end_pos: $end_pos,
-                        text_length: $text_length
-                    })
-                    CREATE (d)-[:HAS_CHUNK]->(c)
-                """,
-                filename=file_name,
-                text=chunk_data['text'],
-                embedding=chunk_data['embedding'],
-                chunk_index=chunk_data['chunk_index'],
-                start_pos=chunk_data['start_pos'],
-                end_pos=chunk_data['end_pos'],
-                text_length=len(chunk_data['text'])
-                )
+
+                def _upsert_chunk(tx):
+                    return tx.run(
+                        """
+                        MATCH (d:Document {filename: $filename})
+                        MERGE (c:Chunk {chunk_id: $chunk_id})
+                        SET c.text = $text,
+                            c.embedding = $embedding,
+                            c.chunk_index = $chunk_index,
+                            c.start_pos = $start_pos,
+                            c.end_pos = $end_pos,
+                            c.text_length = $text_length
+                        MERGE (d)-[:HAS_CHUNK]->(c)
+                        RETURN c
+                        """,
+                        filename=file_name,
+                        chunk_id=f"{file_name}:{chunk_data['chunk_index']}",
+                        text=chunk_data['text'],
+                        embedding=chunk_data['embedding'],
+                        chunk_index=chunk_data['chunk_index'],
+                        start_pos=chunk_data['start_pos'],
+                        end_pos=chunk_data['end_pos'],
+                        text_length=len(chunk_data['text'])
+                    ).single()
+
+                session.execute_write(_upsert_chunk)
                 chunks_created += 1
-            
+
             print(f"✅ Created {chunks_created} Chunk nodes with HAS_CHUNK relationships")
             return True
             
@@ -429,9 +593,9 @@ async def process_blob_document(request: BlobUrlRequest):
         full_text = extract_pdf_text(request.blob_url)
         if not full_text:
             raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
-        
-        # Step 2: Split text into chunks (1000 chars, 150 overlap)
-        chunks = chunk_text(full_text, chunk_size=1000, overlap=150)
+
+        # Step 2: Split text into token-based chunks to reduce 429/quota risk
+        chunks = chunk_text_tokens(full_text)
         
         # Step 3: Generate embeddings for each chunk with robust retry logic
         print(f"🔢 Generating embeddings for {len(chunks)} chunks...")
@@ -443,7 +607,7 @@ async def process_blob_document(request: BlobUrlRequest):
             # Try to generate embedding with multiple attempts for this specific chunk
             embedding = None
             chunk_attempts = 0
-            max_chunk_attempts = 3
+            max_chunk_attempts = 5
             
             while embedding is None and chunk_attempts < max_chunk_attempts:
                 chunk_attempts += 1
@@ -471,10 +635,7 @@ async def process_blob_document(request: BlobUrlRequest):
                 'embedding': embedding
             })
             
-            # Short delay between chunks to avoid rate limits
-            if i < len(chunks) - 1:  # Don't sleep after the last chunk
-                print(f"⏱️ Waiting 1 second before processing next chunk...")
-                time.sleep(1)
+            # No fixed delay between chunks; backoff occurs only on failures/rate limits
         
         # Step 4: Store in Neo4j with proper graph structure
         success = store_document_with_chunks(file_name, full_text, request.blob_url, chunks_with_embeddings)
@@ -508,15 +669,16 @@ async def chat_with_documents(request: ChatRequest):
     """
     try:
         print(f"🤖 Processing question: {request.question}")
-        
+
         # Step 1: Generate embedding for user question
         question_embedding = generate_embeddings(request.question)
         if not question_embedding:
             raise HTTPException(status_code=500, detail="Failed to generate question embedding")
-        
+
         # Step 2: Vector similarity search against chunk_embeddings index
         with neo4j_driver.session() as session:
-            result = session.run("""
+            result = session.run(
+                """
                 CALL db.index.vector.queryNodes('chunk_embeddings', $limit, $question_embedding)
                 YIELD node, score
                 MATCH (d:Document)-[:HAS_CHUNK]->(node)
@@ -527,35 +689,35 @@ async def chat_with_documents(request: ChatRequest):
                     d.filename as document_name,
                     score as similarity_score
                 ORDER BY score DESC
-            """, 
-            limit=request.limit, 
-            question_embedding=question_embedding
+                """,
+                limit=request.limit,
+                question_embedding=question_embedding,
             )
-            
+
             # Step 3: Construct context from retrieved chunks
             retrieved_chunks = []
             context_parts = []
-            
             for record in result:
                 chunk_info = {
                     "chunk_text": record["chunk_text"],
                     "chunk_index": record["chunk_index"],
                     "document_name": record["document_name"],
-                    "similarity_score": record["similarity_score"]
+                    "similarity_score": record["similarity_score"],
                 }
                 retrieved_chunks.append(chunk_info)
-                context_parts.append(f"[From {record['document_name']}, Chunk {record['chunk_index']}]: {record['chunk_text']}")
-        
+                context_parts.append(
+                    f"[From {record['document_name']}, Chunk {record['chunk_index']}]: {record['chunk_text']}"
+                )
+
         if not retrieved_chunks:
             return {
                 "answer": "I couldn't find any relevant information in your documents to answer that question.",
                 "sources": [],
-                "chunks_used": 0
+                "chunks_used": 0,
             }
-        
+
         # Step 4: Create detailed prompt for Gemini
         context_string = "\n\n".join(context_parts)
-        
         prompt = f"""Based on the following document chunks, please provide a comprehensive answer to the user's question.
 
 DOCUMENT CONTEXT:
@@ -563,33 +725,40 @@ DOCUMENT CONTEXT:
 
 USER QUESTION: {request.question}
 
-Please provide a detailed answer based on the document content above. If the information is not sufficient, please state what additional information would be helpful."""
-        
+Please provide a detailed answer based on the document content above. If the information is not sufficient, please state what additional information would be helpful.
+
+Output format rules:
+- Provide a single plain English paragraph.
+- Do not use lists, bullets, numbering, or markdown.
+- Do not include headings or prefixes.
+- Avoid line breaks; keep it as one line if possible."""
+
         # Step 5: Generate response using Gemini
         chat_model = get_chat_model()
         if not chat_model:
             raise HTTPException(status_code=500, detail="Chat model not available")
-        
+
         response = chat_model.generate_content(prompt)
-        
+        answer_text = _clean_answer_text(getattr(response, "text", "") or "")
+
         # Prepare source information
         sources = []
         for chunk in retrieved_chunks:
             source_info = {
                 "document_name": chunk["document_name"],
                 "chunk_index": chunk["chunk_index"],
-                "similarity_score": round(chunk["similarity_score"], 4)
+                "similarity_score": round(chunk["similarity_score"], 4),
             }
             if source_info not in sources:  # Avoid duplicates
                 sources.append(source_info)
-        
+
         return {
-            "answer": response.text,
+            "answer": answer_text,
             "sources": sources,
             "chunks_used": len(retrieved_chunks),
-            "question": request.question
+            "question": request.question,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -636,52 +805,39 @@ async def list_documents():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/hackrx/run")
-async def hackrx_run(request: HackRxRunRequest):
+async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_bearer_token)):
     """
     HackRx endpoint: Process a document and answer multiple questions
     """
     try:
         print(f"🚀 HackRx Run: Processing document and {len(request.questions)} questions")
-        
+
         # Step 1: Process the document first
         blob_request = BlobUrlRequest(blob_url=request.documents)
         process_result = await process_blob_document(blob_request)
-        
+
         if process_result.get("status") != "success":
             raise HTTPException(status_code=500, detail="Failed to process document")
-        
+
         print(f"✅ Document processed: {process_result['filename']}")
-        
+
         # Step 2: Answer all questions
-        answers = []
-        
+        answers: list[str] = []
         for i, question in enumerate(request.questions):
             print(f"🤖 Answering question {i+1}/{len(request.questions)}: {question[:50]}...")
-            
             try:
-                # Use the chat function to get answer
                 chat_request = ChatRequest(question=question, limit=3)
                 chat_result = await chat_with_documents(chat_request)
-                
-                # Extract just the answer text
                 answer = chat_result.get("answer", "Could not generate answer for this question.")
-                answers.append(answer)
-                
-                # Small delay between questions to avoid rate limits
+                answers.append(_clean_answer_text(answer))
                 if i < len(request.questions) - 1:
                     time.sleep(0.5)
-                    
             except Exception as e:
                 print(f"❌ Error answering question {i+1}: {e}")
                 answers.append(f"Error generating answer: {str(e)}")
-        
-        return {
-            "answers": answers,
-            "document_processed": process_result['filename'],
-            "total_questions": len(request.questions),
-            "total_chunks": process_result.get('total_chunks', 0)
-        }
-        
+
+        return {"answers": answers}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -777,6 +933,7 @@ async def health_check():
     """Health check endpoint"""
     try:
         # Test Neo4j connection
+        neo4j_driver.verify_connectivity()
         with _neo4j_session() as session:
             session.run("RETURN 1")
             idx = session.run("SHOW INDEXES YIELD name WHERE name = $name", name=INDEX_NAME).single()

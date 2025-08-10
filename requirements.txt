@@ -71,3 +71,4 @@ langchain
 langchain-google-vertexai
 
 requests==2.31.0
+tiktoken>=0.7.0
