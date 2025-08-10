@@ -152,9 +152,9 @@ def _try_create_index(session, dims: int) -> str | None:
         return "ddl"
     except ClientError as e:
         # Fall through to procedure
-        print(f"⚠️ DDL create failed: {e}")
+        pass
     except Exception as e:
-        print(f"⚠️ DDL create error: {e}")
+        pass
 
     # Procedure
     try:
@@ -166,16 +166,16 @@ def _try_create_index(session, dims: int) -> str | None:
         ).consume()
         return "procedure"
     except ClientError as e:
-        print(f"⚠️ Procedure create failed: {e}")
+        pass
     except Exception as e:
-        print(f"⚠️ Procedure create error: {e}")
+        pass
     return None
 
 def _init_vertex_if_needed():
     try:
         vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
     except Exception as e:
-        print(f"⚠️ Vertex init warning: {e}")
+        pass
 
 
 def _get_embedding_client(model_name: str) -> TextEmbeddingModel | None:
@@ -186,10 +186,8 @@ def _get_embedding_client(model_name: str) -> TextEmbeddingModel | None:
         _init_vertex_if_needed()
         client = TextEmbeddingModel.from_pretrained(model_name)
         _embedding_clients[model_name] = client
-        print(f"✅ Embedding client ready ({model_name})")
         return client
-    except Exception as e:
-        print(f"❌ Failed to init embedding client {model_name}: {e}")
+    except Exception:
         return None
 
 
@@ -217,24 +215,19 @@ def get_chat_model():
             for model_name in models_to_try:
                 try:
                     _chat_model = GenerativeModel(model_name)
-                    print(f"✅ Chat model initialized ({model_name})")
                     return _chat_model
                 except Exception as model_error:
-                    print(f"⚠️ Failed to load {model_name}: {model_error}")
                     continue
             
-            print("❌ No compatible model found")
             return None
             
         except Exception as e:
-            print(f"❌ Error initializing chat model: {e}")
             return None
     return _chat_model
 
 def extract_pdf_text(blob_url):
     """Extract text from PDF blob URL"""
     try:
-        print(f"📄 Downloading PDF from: {blob_url}")
         response = requests.get(blob_url, timeout=30)
         response.raise_for_status()
         
@@ -246,11 +239,9 @@ def extract_pdf_text(blob_url):
             page_text = page.extract_text()
             text += page_text + "\n"
             
-        print(f"📝 Extracted {len(text)} characters from {len(pdf_reader.pages)} pages")
         return text.strip()
         
     except Exception as e:
-        print(f"❌ Error extracting PDF text: {e}")
         return None
 
 def chunk_text(text, chunk_size=1000, overlap=150):
@@ -285,7 +276,6 @@ def chunk_text(text, chunk_size=1000, overlap=150):
         if start >= len(text):
             break
     
-    print(f"🔪 Split text into {len(chunks)} chunks (size: {chunk_size}, overlap: {overlap})")
     return chunks
 
 def _get_tokenizer():
@@ -308,7 +298,6 @@ def chunk_text_tokens(text: str, chunk_tokens: int = None, overlap_tokens: int =
     enc = _get_tokenizer()
     if enc is None:
         # Fallback to character-based splitter
-        print("⚠️ Tokenizer not available; using character-based splitting")
         return chunk_text(text, chunk_size=chunk_tokens * 4, overlap=overlap_tokens * 4)
 
     tokens = enc.encode(text)
@@ -333,7 +322,6 @@ def chunk_text_tokens(text: str, chunk_tokens: int = None, overlap_tokens: int =
         start = end - overlap_tokens
         if start < 0:
             start = 0
-    print(f"🔪 Split text into {len(chunks)} token-chunks (tokens: {chunk_tokens}, overlap: {overlap_tokens})")
     return chunks
 
 def _is_rate_limit_error(err: Exception) -> bool:
@@ -383,10 +371,8 @@ def embed_text(text, max_retries=5):
             except Exception as e:
                 last_err = e
                 if _is_rate_limit_error(e):
-                    print(f"⚠️ Rate limited on {model_name}. Trying next model immediately (attempt {attempt}/{max_retries}).")
                     continue  # move to next model without delay
                 else:
-                    print(f"⚠️ Embedding error on {model_name}: {e}. Trying next model.")
                     continue
 
         # After a full round, backoff with jitter and rotate the start index
@@ -394,7 +380,6 @@ def embed_text(text, max_retries=5):
             base = 2 ** (attempt - 1)
             time.sleep(base + random.uniform(0, 0.5))
             start_idx = (start_idx + 1) % mcount
-    print(f"❌ Failed to embed after {max_retries} attempts. Last error: {last_err}")
     return None
 
 
@@ -403,7 +388,6 @@ def generate_embeddings(text, max_retries=5):
     try:
         return embed_text(text, max_retries=max_retries)
     except Exception as e:
-        print(f"❌ Error generating embeddings: {e}")
         return None
 
 def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embeddings):
@@ -431,13 +415,12 @@ def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embed
             if not document_node:
                 raise Exception("Failed to create Document node")
 
-            print(f"📊 Created Document node: {file_name}")
+            
 
             # Now create Chunk nodes and relationships
             chunks_created = 0
             for chunk_data in chunks_with_embeddings:
                 if chunk_data['embedding'] is None:
-                    print(f"⚠️ Skipping chunk {chunk_data['chunk_index']} - no embedding")
                     continue
 
                 def _upsert_chunk(tx):
@@ -467,11 +450,10 @@ def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embed
                 session.execute_write(_upsert_chunk)
                 chunks_created += 1
 
-            print(f"✅ Created {chunks_created} Chunk nodes with HAS_CHUNK relationships")
+            
             return True
             
     except Exception as e:
-        print(f"❌ Error storing document with chunks: {e}")
         return False
 
 async def _async_hackrx_job(job_id: str, documents: str, questions: list[str]):
@@ -526,9 +508,7 @@ def _setup_neo4j_core(force: bool = False):
                 if not force:
                     return {"ok": True, "index": INDEX_NAME, "present": True, "message": "Index already exists"}
                 # Drop then recreate
-                print("⚠️ Force requested. Dropping existing index before recreate…")
                 session.run(f"DROP INDEX {INDEX_NAME} IF EXISTS").consume()
-                print("🗑️ Dropped old vector index")
 
             # Determine dimensions via sample embedding
             dims_probe = DEFAULT_DIMS
@@ -536,11 +516,10 @@ def _setup_neo4j_core(force: bool = False):
                 sample = generate_embeddings("vector index setup dimension probe")
                 if sample and isinstance(sample, list):
                     dims_probe = len(sample)
-                    print(f"ℹ️ Detected embedding dimensions: {dims_probe}")
                 else:
-                    print(f"ℹ️ Could not detect embedding dimensions, using default {DEFAULT_DIMS}")
+                    pass
             except Exception as dim_err:
-                print(f"⚠️ Dimension detection failed, using default {DEFAULT_DIMS}: {dim_err}")
+                pass
 
             dims_candidates = [dims_probe]
             if 768 not in dims_candidates:
@@ -550,7 +529,6 @@ def _setup_neo4j_core(force: bool = False):
             for dims in dims_candidates:
                 method = _try_create_index(session, dims)
                 if method and _index_exists(session):
-                    print(f"✅ Vector index '{INDEX_NAME}' created via {method} (dims={dims})")
                     return {"ok": True, "index": INDEX_NAME, "present": True, "created_with": method, "dims": dims}
                 last_err = f"creation failed for dims={dims}"
 
@@ -558,7 +536,6 @@ def _setup_neo4j_core(force: bool = False):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error creating vector index: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create vector index: {str(e)}")
 
 
@@ -583,7 +560,6 @@ async def process_blob_document(request: BlobUrlRequest):
     4. Store in Neo4j with Document->Chunk structure
     """
     try:
-        print(f"🚀 Processing blob document: {request.blob_url}")
         
         # Extract filename from URL
         parsed_url = urlparse(request.blob_url)
@@ -598,11 +574,11 @@ async def process_blob_document(request: BlobUrlRequest):
         chunks = chunk_text_tokens(full_text)
         
         # Step 3: Generate embeddings for each chunk with robust retry logic
-        print(f"🔢 Generating embeddings for {len(chunks)} chunks...")
+        
         chunks_with_embeddings = []
         
         for i, chunk in enumerate(chunks):
-            print(f"Processing chunk {i+1}/{len(chunks)}")
+            
             
             # Try to generate embedding with multiple attempts for this specific chunk
             embedding = None
@@ -611,7 +587,6 @@ async def process_blob_document(request: BlobUrlRequest):
             
             while embedding is None and chunk_attempts < max_chunk_attempts:
                 chunk_attempts += 1
-                print(f"  Attempt {chunk_attempts}/{max_chunk_attempts} for chunk {i+1}")
                 
                 # Generate embeddings with retry logic
                 embedding = generate_embeddings(chunk['text'])
@@ -619,13 +594,12 @@ async def process_blob_document(request: BlobUrlRequest):
                 if embedding is None and chunk_attempts < max_chunk_attempts:
                     # Wait longer for chunk-level retries
                     wait_time = 10 + (chunk_attempts * 5)  # 15s, 20s for chunk retries
-                    print(f"  ❌ Chunk {i+1} failed attempt {chunk_attempts}. Waiting {wait_time}s before retry...")
                     time.sleep(wait_time)
             
             if embedding is None:
-                print(f"⚠️ Failed to generate embedding for chunk {i+1} after {max_chunk_attempts} attempts")
+                pass
             else:
-                print(f"✅ Successfully processed chunk {i+1}")
+                pass
             
             chunks_with_embeddings.append({
                 'text': chunk['text'],
@@ -659,7 +633,6 @@ async def process_blob_document(request: BlobUrlRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error processing blob document: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
 @router.post("/chat")
@@ -668,7 +641,6 @@ async def chat_with_documents(request: ChatRequest):
     Chat with documents using chunk-based vector similarity search
     """
     try:
-        print(f"🤖 Processing question: {request.question}")
 
         # Step 1: Generate embedding for user question
         question_embedding = generate_embeddings(request.question)
@@ -762,7 +734,6 @@ Output format rules:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error in chat: {e}")
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
 
 @router.get("/documents")
@@ -801,7 +772,6 @@ async def list_documents():
         }
         
     except Exception as e:
-        print(f"❌ Error listing documents: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/hackrx/run")
@@ -810,7 +780,6 @@ async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_be
     HackRx endpoint: Process a document and answer multiple questions
     """
     try:
-        print(f"🚀 HackRx Run: Processing document and {len(request.questions)} questions")
 
         # Step 1: Process the document first
         blob_request = BlobUrlRequest(blob_url=request.documents)
@@ -819,12 +788,11 @@ async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_be
         if process_result.get("status") != "success":
             raise HTTPException(status_code=500, detail="Failed to process document")
 
-        print(f"✅ Document processed: {process_result['filename']}")
+        
 
         # Step 2: Answer all questions
         answers: list[str] = []
         for i, question in enumerate(request.questions):
-            print(f"🤖 Answering question {i+1}/{len(request.questions)}: {question[:50]}...")
             try:
                 chat_request = ChatRequest(question=question, limit=3)
                 chat_result = await chat_with_documents(chat_request)
@@ -833,7 +801,6 @@ async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_be
                 if i < len(request.questions) - 1:
                     time.sleep(0.5)
             except Exception as e:
-                print(f"❌ Error answering question {i+1}: {e}")
                 answers.append(f"Error generating answer: {str(e)}")
 
         return {"answers": answers}
@@ -841,7 +808,6 @@ async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_be
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error in HackRx run: {e}")
         raise HTTPException(status_code=500, detail=f"HackRx run failed: {str(e)}")
 
 @router.post("/reset-database")
@@ -867,7 +833,6 @@ async def reset_database():
             }
             
     except Exception as e:
-        print(f"❌ Error during reset: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/cleanup")
@@ -903,7 +868,6 @@ async def cleanup_database():
             }
             
     except Exception as e:
-        print(f"❌ Error during cleanup: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/hackrx/run-async", response_model=HackRxJobStartResponse)
