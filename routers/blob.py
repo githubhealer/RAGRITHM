@@ -301,7 +301,7 @@ def _get_tokenizer():
 def chunk_text_tokens(text: str, chunk_tokens: int = None, overlap_tokens: int = None):
     """Split text into token-based overlapping chunks.    """
     if chunk_tokens is None:
-        chunk_tokens = int(os.getenv("CHUNK_TOKENS", "2900"))
+        chunk_tokens = int(os.getenv("CHUNK_TOKENS", "2922"))
     if overlap_tokens is None:
         overlap_tokens = int(os.getenv("OVERLAP_TOKENS", "150"))
 
