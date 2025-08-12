@@ -20,25 +20,15 @@ app.add_middleware(
 
 app.include_router(blob.router)
 
+# Direct alias without /blob prefix (preserves auth requirement)
 @app.post("/hackrx/run")
-async def hackrx_run_direct(request: blob.HackRxRunRequest):
-    """Direct HackRx endpoint without /blob prefix"""
-    return await blob.hackrx_run(request)
+async def hackrx_run_direct(request: blob.HackRxRunRequest, _auth: bool = fastapi.Depends(blob.require_bearer_token)):
+    return await blob.hackrx_run(request, _auth=_auth)
 
-# Alias to match external webhook format requirement
+# Versioned alias for external integrations (/api/v1)
 @app.post("/api/v1/hackrx/run")
-async def hackrx_run_v1(request: blob.HackRxRunRequest):
-    return await blob.hackrx_run(request)
-
-# Async job endpoints (optional): start and poll status under /api/v1
-@app.post("/api/v1/hackrx/run-async")
-async def hackrx_run_async_v1(request: blob.HackRxRunRequest, background_tasks: BackgroundTasks):
-    # Delegate to router handler with injected BackgroundTasks so task runs
-    return await blob.hackrx_run_async(request, background_tasks)
-
-@app.get("/api/v1/hackrx/status/{job_id}")
-async def hackrx_status_v1(job_id: str):
-    return await blob.hackrx_status(job_id)
+async def hackrx_run_v1(request: blob.HackRxRunRequest, _auth: bool = fastapi.Depends(blob.require_bearer_token)):
+    return await blob.hackrx_run(request, _auth=_auth)
 
 @app.get("/")
 async def read_root():

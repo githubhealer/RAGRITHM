@@ -79,6 +79,7 @@ class BlobUrlRequest(BaseModel):
 class ChatRequest(BaseModel):
     question: str
     limit: int = 5
+    document_filename: str | None = None  # optional: restrict retrieval to a single processed document
 
 class HackRxRunRequest(BaseModel):
     documents: str  # Single document URL for now
@@ -201,29 +202,39 @@ def get_embedding_model():
     return _embedding_model
 
 def get_chat_model():
-    """Get or create chat model instance"""
+    """Get or create chat model instance with deterministic config."""
     global _chat_model
     if _chat_model is None:
         try:
             vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
-            
-            # Try different model versions in order of preference
-            models_to_try = [
-                "gemini-2.5-flash-lite"
-            ]
-            
+            models_to_try = ["gemini-2.5-flash-lite"]
             for model_name in models_to_try:
                 try:
                     _chat_model = GenerativeModel(model_name)
-                    return _chat_model
-                except Exception as model_error:
+                    break
+                except Exception:
                     continue
-            
-            return None
-            
-        except Exception as e:
-            return None
+        except Exception:
+            _chat_model = None
     return _chat_model
+
+
+_GENERATION_CONFIG = {
+    "temperature": 0.0,  # deterministic
+    "top_p": 0.0,
+    "top_k": 1,
+    "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", "512")),
+}
+
+def _generate_answer(prompt: str) -> str:
+    model = get_chat_model()
+    if not model:
+        return "Model unavailable to answer the question."
+    try:
+        response = model.generate_content(prompt, generation_config=_GENERATION_CONFIG)
+        return _clean_answer_text(getattr(response, "text", "") or "")
+    except Exception:
+        return "Unable to generate answer due to a generation error."  # keep generic, deterministic
 
 def extract_pdf_text(blob_url):
     """Extract text from PDF blob URL"""
@@ -647,24 +658,44 @@ async def chat_with_documents(request: ChatRequest):
         if not question_embedding:
             raise HTTPException(status_code=500, detail="Failed to generate question embedding")
 
-        # Step 2: Vector similarity search against chunk_embeddings index
+        # Step 2: Vector similarity search against chunk_embeddings index (optionally scoped to a single document)
         with neo4j_driver.session() as session:
-            result = session.run(
+            if request.document_filename:
+                cypher = """
+                CALL db.index.vector.queryNodes('chunk_embeddings', $raw_limit, $question_embedding)
+                YIELD node, score
+                MATCH (d:Document)-[:HAS_CHUNK]->(node)
+                WHERE d.filename = $doc AND node.text IS NOT NULL
+                RETURN node.text as chunk_text,
+                       node.chunk_index as chunk_index,
+                       d.filename as document_name,
+                       score as similarity_score
+                ORDER BY score DESC
+                LIMIT $limit
                 """
+                params = {
+                    "raw_limit": max(request.limit * 3, request.limit),  # overfetch then limit for resilience
+                    "limit": request.limit,
+                    "question_embedding": question_embedding,
+                    "doc": request.document_filename,
+                }
+            else:
+                cypher = """
                 CALL db.index.vector.queryNodes('chunk_embeddings', $limit, $question_embedding)
                 YIELD node, score
                 MATCH (d:Document)-[:HAS_CHUNK]->(node)
                 WHERE d.filename IS NOT NULL AND node.text IS NOT NULL
-                RETURN 
-                    node.text as chunk_text,
-                    node.chunk_index as chunk_index,
-                    d.filename as document_name,
-                    score as similarity_score
+                RETURN node.text as chunk_text,
+                       node.chunk_index as chunk_index,
+                       d.filename as document_name,
+                       score as similarity_score
                 ORDER BY score DESC
-                """,
-                limit=request.limit,
-                question_embedding=question_embedding,
-            )
+                """
+                params = {
+                    "limit": request.limit,
+                    "question_embedding": question_embedding,
+                }
+            result = session.run(cypher, **params)
 
             # Step 3: Construct context from retrieved chunks
             retrieved_chunks = []
@@ -690,28 +721,31 @@ async def chat_with_documents(request: ChatRequest):
 
         # Step 4: Create detailed prompt for Gemini
         context_string = "\n\n".join(context_parts)
-        prompt = f"""Based on the following document chunks, please provide a comprehensive answer to the user's question.
+        prompt = f"""You are a precise insurance policy QA assistant. Use ONLY the facts inside the provided DOCUMENT CONTEXT to answer the USER QUESTION.
+If the answer is not explicitly stated, reply exactly: "Information not found in the provided document."
+
+Quality rules:
+1. Single factual sentence (or two short sentences only if absolutely required for clarity).
+2. No lists, bullets, numbering, markdown, or extraneous elaboration.
+3. Do not hallucinate numbers, time periods, limits, or benefits not present in context.
+4. Preserve numeric values and time durations exactly as written.
+5. Do not mention chunk indices or 'document' in the answer.
 
 DOCUMENT CONTEXT:
 {context_string}
 
 USER QUESTION: {request.question}
 
-Please provide a detailed answer based on the document content above. If the information is not sufficient, please state what additional information would be helpful.
+Answer:"""
 
-Output format rules:
-- Provide a single plain English paragraph.
-- Do not use lists, bullets, numbering, or markdown.
-- Do not include headings or prefixes.
-- Avoid line breaks; keep it as one line if possible."""
-
-        # Step 5: Generate response using Gemini
-        chat_model = get_chat_model()
-        if not chat_model:
-            raise HTTPException(status_code=500, detail="Chat model not available")
-
-        response = chat_model.generate_content(prompt)
-        answer_text = _clean_answer_text(getattr(response, "text", "") or "")
+        # Step 5: Deterministic generation
+        answer_text = _generate_answer(prompt)
+        if not answer_text:
+            answer_text = "Information not found in the provided document."
+        # Enforce single line & terminal period for consistency
+        answer_text = _clean_answer_text(answer_text)
+        if answer_text and not answer_text.endswith(('.', '!', '?')):
+            answer_text += '.'
 
         # Prepare source information
         sources = []
@@ -729,6 +763,7 @@ Output format rules:
             "sources": sources,
             "chunks_used": len(retrieved_chunks),
             "question": request.question,
+            "document": request.document_filename,
         }
 
     except HTTPException:
@@ -780,31 +815,54 @@ async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_be
     HackRx endpoint: Process a document and answer multiple questions
     """
     try:
+        # Derive filename for potential reuse optimization
+        parsed_url = urlparse(request.documents)
+        candidate_filename = parsed_url.path.split('/')[-1] or "unknown_document.pdf"
 
-        # Step 1: Process the document first
-        blob_request = BlobUrlRequest(blob_url=request.documents)
-        process_result = await process_blob_document(blob_request)
+        # Step 1: Reuse existing processed document if already embedded
+        with neo4j_driver.session() as session:
+            doc_check = session.run(
+                """
+                MATCH (d:Document {filename: $filename})-[:HAS_CHUNK]->(c:Chunk)
+                RETURN d.filename as filename, count(c) as chunk_count, d.total_chunks as expected_chunks
+                """,
+                filename=candidate_filename,
+            ).single()
 
-        if process_result.get("status") != "success":
-            raise HTTPException(status_code=500, detail="Failed to process document")
+        if doc_check and doc_check["chunk_count"] and doc_check["chunk_count"] > 0:
+            process_result = {
+                "status": "success",
+                "filename": candidate_filename,
+                "total_chunks": doc_check["chunk_count"],
+            }
+        else:
+            blob_request = BlobUrlRequest(blob_url=request.documents)
+            process_result = await process_blob_document(blob_request)
+            if process_result.get("status") != "success":
+                raise HTTPException(status_code=500, detail="Failed to process document")
 
-        
-
-        # Step 2: Answer all questions
+        # Step 2: Answer all questions deterministically & document-scoped
         answers: list[str] = []
+        doc_filename = process_result.get("filename")
         for i, question in enumerate(request.questions):
+            chat_request = ChatRequest(
+                question=question,
+                limit=8,
+                document_filename=doc_filename,
+            )
             try:
-                chat_request = ChatRequest(question=question, limit=3)
                 chat_result = await chat_with_documents(chat_request)
-                answer = chat_result.get("answer", "Could not generate answer for this question.")
-                answers.append(_clean_answer_text(answer))
-                if i < len(request.questions) - 1:
-                    time.sleep(0.5)
-            except Exception as e:
-                answers.append(f"Error generating answer: {str(e)}")
+                answer = chat_result.get("answer", "Information not found in the provided document.")
+            except Exception:
+                answer = "Information not found in the provided document."
+            clean = _clean_answer_text(answer)
+            if clean and not clean.endswith((".", "!", "?")):
+                clean += "."
+            answers.append(clean)
+            if i < len(request.questions) - 1:
+                time.sleep(0.15)  # slight pacing to avoid burst limits
 
         return {"answers": answers}
-
     except HTTPException:
         raise
     except Exception as e:
