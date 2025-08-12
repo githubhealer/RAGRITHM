@@ -220,9 +220,9 @@ def get_chat_model():
 
 
 _GENERATION_CONFIG = {
-    "temperature": 0.0,  # deterministic
-    "top_p": 0.0,
-    "top_k": 1,
+    "temperature": float(os.getenv("GEN_TEMPERATURE", "0.2")),  # slight creativity for fuller justification
+    "top_p": float(os.getenv("GEN_TOP_P", "0.85")),
+    "top_k": int(os.getenv("GEN_TOP_K", "20")),
     "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", "512")),
 }
 
@@ -352,6 +352,60 @@ def _truncate_or_pad(vec: list[float], target: int) -> list[float]:
     if len(vec) > target:
         return vec[:target]
     return vec + [0.0] * (target - len(vec))
+
+
+# --- Fallback retrieval helpers ---
+_STOP_WORDS = {"what","is","the","for","and","are","any","with","under","plus","policy","plan","does","this","cover","of","to","a","an","in","on","by","be","it"}
+
+def _extract_keywords(question: str, min_len: int = 4, max_keywords: int = 8) -> list[str]:
+    tokens = re.findall(r"[A-Za-z]{3,}", question.lower())
+    kws: list[str] = []
+    for t in tokens:
+        if t in _STOP_WORDS or len(t) < min_len:
+            continue
+        if t not in kws:
+            kws.append(t)
+        if len(kws) >= max_keywords:
+            break
+    return kws
+
+def _keyword_search(session, keywords: list[str], doc: str | None, limit: int) -> list[dict[str, any]]:
+    if not keywords:
+        return []
+    if doc:
+        cypher = """
+        UNWIND $keywords AS kw
+        MATCH (d:Document {filename:$doc})-[:HAS_CHUNK]->(c:Chunk)
+        WHERE c.text CONTAINS kw
+        RETURN c.text as chunk_text,
+               c.chunk_index as chunk_index,
+               d.filename as document_name,
+               0.0 as similarity_score
+        LIMIT $limit
+        """
+        params = {"keywords": keywords, "doc": doc, "limit": limit}
+    else:
+        cypher = """
+        UNWIND $keywords AS kw
+        MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
+        WHERE c.text CONTAINS kw
+        RETURN c.text as chunk_text,
+               c.chunk_index as chunk_index,
+               d.filename as document_name,
+               0.0 as similarity_score
+        LIMIT $limit
+        """
+        params = {"keywords": keywords, "limit": limit}
+    result = session.run(cypher, **params)
+    out: list[dict[str, any]] = []
+    for r in result:
+        out.append({
+            "chunk_text": r["chunk_text"],
+            "chunk_index": r["chunk_index"],
+            "document_name": r["document_name"],
+            "similarity_score": r["similarity_score"],
+        })
+    return out
 
 
 def embed_text(text, max_retries=5):
@@ -721,22 +775,24 @@ async def chat_with_documents(request: ChatRequest):
 
         # Step 4: Create detailed prompt for Gemini
         context_string = "\n\n".join(context_parts)
-        prompt = f"""You are a precise insurance policy QA assistant. Use ONLY the facts inside the provided DOCUMENT CONTEXT to answer the USER QUESTION.
-If the answer is not explicitly stated, reply exactly: "Information not found in the provided document."
+        prompt = f"""You are a precise insurance policy QA assistant. Use ONLY the facts inside DOCUMENT CONTEXT to answer USER QUESTION.
+If the exact answer is present, write a concise factual justification sentence. If NOT present, output exactly: Information not found in the provided document.
 
-Quality rules:
-1. Single factual sentence (or two short sentences only if absolutely required for clarity).
-2. No lists, bullets, numbering, markdown, or extraneous elaboration.
-3. Do not hallucinate numbers, time periods, limits, or benefits not present in context.
-4. Preserve numeric values and time durations exactly as written.
-5. Do not mention chunk indices or 'document' in the answer.
+Then the system will prepend a Yes/No indicator automatically, so DO NOT add Yes or No yourself.
+
+Strict rules:
+1. One concise sentence (optionally two if a definition plus a numeric fact are both essential).
+2. No lists, bullets, numbering, or markdown.
+3. No speculation or invented numbers.
+4. Preserve all numeric values, durations, percentages verbatim.
+5. Do not mention 'chunk', 'context', or 'document'.
 
 DOCUMENT CONTEXT:
 {context_string}
 
 USER QUESTION: {request.question}
 
-Answer:"""
+Justification sentence:"""
 
         # Step 5: Deterministic generation
         answer_text = _generate_answer(prompt)
@@ -746,6 +802,12 @@ Answer:"""
         answer_text = _clean_answer_text(answer_text)
         if answer_text and not answer_text.endswith(('.', '!', '?')):
             answer_text += '.'
+
+        # Prepend Yes/No based on availability
+        if answer_text.lower().startswith("information not found"):
+            answer_text = f"No. {answer_text}"
+        else:
+            answer_text = f"Yes. {answer_text}"
 
         # Prepare source information
         sources = []
@@ -757,6 +819,109 @@ Answer:"""
             }
             if source_info not in sources:  # Avoid duplicates
                 sources.append(source_info)
+
+        # --- Fallback: broaden retrieval if answer came back as Not Found ---
+        if answer_text.lower().startswith("no. information not found"):
+            keywords = _extract_keywords(request.question)
+            combined: list[dict[str, any]] = []
+            seen: set[tuple[str,int]] = set()
+            # Expanded vector search
+            with neo4j_driver.session() as session:
+                if request.document_filename:
+                    cypher_fb = """
+                    CALL db.index.vector.queryNodes('chunk_embeddings', $raw_limit, $qemb)
+                    YIELD node, score
+                    MATCH (d:Document)-[:HAS_CHUNK]->(node)
+                    WHERE node.text IS NOT NULL AND d.filename = $doc
+                    RETURN node.text as chunk_text,
+                           node.chunk_index as chunk_index,
+                           d.filename as document_name,
+                           score as similarity_score
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """
+                    params_fb = {
+                        "raw_limit": max(request.limit * 6, 36),
+                        "limit": max(request.limit * 2, 16),
+                        "qemb": question_embedding,
+                        "doc": request.document_filename,
+                    }
+                else:
+                    cypher_fb = """
+                    CALL db.index.vector.queryNodes('chunk_embeddings', $raw_limit, $qemb)
+                    YIELD node, score
+                    MATCH (d:Document)-[:HAS_CHUNK]->(node)
+                    WHERE node.text IS NOT NULL
+                    RETURN node.text as chunk_text,
+                           node.chunk_index as chunk_index,
+                           d.filename as document_name,
+                           score as similarity_score
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """
+                    params_fb = {
+                        "raw_limit": max(request.limit * 6, 36),
+                        "limit": max(request.limit * 2, 16),
+                        "qemb": question_embedding,
+                    }
+                fb_result = session.run(cypher_fb, **params_fb)
+                for rec in fb_result:
+                    key = (rec["document_name"], rec["chunk_index"])
+                    if key not in seen:
+                        seen.add(key)
+                        combined.append({
+                            "chunk_text": rec["chunk_text"],
+                            "chunk_index": rec["chunk_index"],
+                            "document_name": rec["document_name"],
+                            "similarity_score": rec["similarity_score"],
+                        })
+                # Keyword search (document scoped first)
+                kw_chunks = _keyword_search(session, keywords, request.document_filename, 20)
+                if not kw_chunks and not request.document_filename:
+                    kw_chunks = _keyword_search(session, keywords, None, 20)
+                for ch in kw_chunks:
+                    key = (ch["document_name"], ch["chunk_index"])
+                    if key not in seen:
+                        seen.add(key)
+                        combined.append(ch)
+            # Add original retrieved chunks to priority front
+            for ch in retrieved_chunks:
+                key = (ch["document_name"], ch["chunk_index"])
+                if key not in seen:
+                    seen.add(key)
+                    combined.insert(0, ch)
+            if combined:
+                context_parts_fb = [
+                    f"[From {c['document_name']}, Chunk {c['chunk_index']}]: {c['chunk_text']}" for c in combined[:40]
+                ]
+                context_string_fb = "\n\n".join(context_parts_fb)
+                prompt_fb = f"""You are a precise insurance policy QA assistant. Use ONLY the facts inside DOCUMENT CONTEXT to answer USER QUESTION.
+If the exact answer is present, write a concise factual justification sentence. If NOT present, output exactly: Information not found in the provided document.
+
+Do NOT add Yes or No yourself.
+
+DOCUMENT CONTEXT:
+{context_string_fb}
+
+USER QUESTION: {request.question}
+
+Justification sentence:"""
+                second = _generate_answer(prompt_fb)
+                second = _clean_answer_text(second)
+                if second and not second.lower().startswith("information not found"):
+                    if not second.endswith((".","!","?")):
+                        second += "."
+                    answer_text = f"Yes. {second}"
+                # Update sources to combined (top N)
+                sources = []
+                for ch in combined[:40]:
+                    si = {
+                        "document_name": ch["document_name"],
+                        "chunk_index": ch["chunk_index"],
+                        "similarity_score": round(ch["similarity_score"], 4),
+                    }
+                    if si not in sources:
+                        sources.append(si)
 
         return {
             "answer": answer_text,
@@ -847,18 +1012,17 @@ async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_be
         for i, question in enumerate(request.questions):
             chat_request = ChatRequest(
                 question=question,
-                limit=8,
+                limit=12,
                 document_filename=doc_filename,
             )
             try:
                 chat_result = await chat_with_documents(chat_request)
-                answer = chat_result.get("answer", "Information not found in the provided document.")
+                answer = chat_result.get("answer", "No. Information not found in the provided document.")
             except Exception:
-                answer = "Information not found in the provided document."
+                answer = "No. Information not found in the provided document."
+            # Already cleaned & prefixed upstream; just ensure single line
             clean = _clean_answer_text(answer)
-            if clean and not clean.endswith((".", "!", "?")):
-                clean += "."
-            answers.append(clean)
+            answers.append(clean if clean else "No. Information not found in the provided document.")
             if i < len(request.questions) - 1:
                 time.sleep(0.15)  # slight pacing to avoid burst limits
 
