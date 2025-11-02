@@ -19,5 +19,5 @@ COPY . .
 
 EXPOSE 8080
 
-# Use Cloud Run's PORT environment variable
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1
+# Use Cloud Run's PORT environment variable (Cloud Run sets this to 8080)
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --timeout-keep-alive 300
