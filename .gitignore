@@ -58,20 +58,40 @@ frontend/dist/
 # Credentials/Keys (adjust patterns as needed)
 # Service account keys should never be committed
 psyched-age-*.json
+axial-camp-*.json
+*-credentials.json
 *.json
 !package*.json
 !tsconfig*.json
 !.vscode/*.json
 !frontend/package*.json
 !frontend/tsconfig*.json
+!cloudbuild.yaml
+!frontend/vite.config.ts
 # If you store credentials under gcp/, ignore all JSON there
 /gcp/*.json
+
+# Specific credential files to never commit
+.env
+.env.local
+.env.production
+.env.development
+*.pem
+*.key
+*.cert
 
 # Neo4j local volumes (if used outside docker-compose)
 neo4j/data/
 neo4j/logs/
 neo4j/import/
 neo4j/plugins/
+
+# Neo4j credential files
+*.txt
+!requirements.txt
+!README.txt
+neo4j*.txt
+*neo4j*.txt
 
 # Documents (optional; comment out to track)
 documents/

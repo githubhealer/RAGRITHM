@@ -1,6 +1,5 @@
 import fastapi
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import BackgroundTasks
 from routers import blob
 
 app = fastapi.FastAPI()
@@ -11,6 +10,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://ragrithm-frontend-*-uc.a.run.app",  # Allow frontend Cloud Run
         "*",  # adjust/remove wildcard for production
     ],
     allow_credentials=True,
@@ -18,17 +18,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Increase file upload limits
+app.router.route_class = fastapi.routing.APIRoute
+
 app.include_router(blob.router)
-
-# Direct alias without /blob prefix (preserves auth requirement)
-@app.post("/hackrx/run")
-async def hackrx_run_direct(request: blob.HackRxRunRequest, _auth: bool = fastapi.Depends(blob.require_bearer_token)):
-    return await blob.hackrx_run(request, _auth=_auth)
-
-# Versioned alias for external integrations (/api/v1)
-@app.post("/api/v1/hackrx/run")
-async def hackrx_run_v1(request: blob.HackRxRunRequest, _auth: bool = fastapi.Depends(blob.require_bearer_token)):
-    return await blob.hackrx_run(request, _auth=_auth)
 
 @app.get("/")
 async def read_root():

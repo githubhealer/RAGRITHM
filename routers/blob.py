@@ -3,7 +3,7 @@
 import requests
 import PyPDF2
 import io
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Header
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File
 from pydantic import BaseModel
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
@@ -15,8 +15,6 @@ from neo4j.exceptions import ClientError, ServiceUnavailable, SessionExpired
 from urllib.parse import urlparse
 import time
 import re
-import uuid
-import asyncio
 from typing import Dict, Any
 import random
 
@@ -49,6 +47,7 @@ INDEX_NAME = os.getenv("NEO4J_VECTOR_INDEX", "chunk_embeddings")
 INDEX_PROP = os.getenv("NEO4J_VECTOR_PROPERTY", "embedding")
 NEO4J_DB = os.getenv("NEO4J_DATABASE")  # optional; Aura often uses 'neo4j'
 DEFAULT_DIMS = int(os.getenv("EMBEDDING_DIMS", "768"))
+DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "documents")  # local folder for PDFs
 
 # Embedding configuration
 EMBEDDING_TARGET_DIMS = int(os.getenv("EMBEDDING_TARGET_DIMS", str(DEFAULT_DIMS)))  # enforce 768 by default
@@ -64,15 +63,6 @@ _embedding_model = None  # retained for health check compatibility
 _embedding_clients: Dict[str, TextEmbeddingModel] = {}
 _chat_model = None
 
-# In-memory progress tracking for long-running jobs (ephemeral per instance)
-_jobs: Dict[str, Dict[str, Any]] = {}
-
-def _set_progress(job_id: str, **kwargs):
-    job = _jobs.get(job_id, {})
-    job.update(kwargs)
-    job["updated_at"] = time.time()
-    _jobs[job_id] = job
-
 class BlobUrlRequest(BaseModel):
     blob_url: str
 
@@ -80,28 +70,6 @@ class ChatRequest(BaseModel):
     question: str
     limit: int = 5
     document_filename: str | None = None  # optional: restrict retrieval to a single processed document
-
-class HackRxRunRequest(BaseModel):
-    documents: str  # Single document URL for now
-    questions: list[str]
-
-class HackRxJobStartResponse(BaseModel):
-    job_id: str
-    status_url: str
-
-
-# --- Simple Bearer token auth dependency ---
-def require_bearer_token(authorization: str | None = Header(default=None)):
-    expected = os.getenv("API_BEARER_TOKEN", "").strip()
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="missing or invalid authorization header")
-    token = authorization.split(" ", 1)[1].strip()
-    # If expected token is configured, enforce exact match
-    if expected:
-        if token != expected:
-            raise HTTPException(status_code=401, detail="invalid token")
-    # If expected is empty, accept any non-empty bearer token
-    return True
 
 
 def _neo4j_session():
@@ -111,20 +79,77 @@ def _neo4j_session():
     return neo4j_driver.session()
 
 
+def _policy_scope_mismatch(question: str, doc_filename: str | None) -> bool:
+    """Heuristic: decide if we should ignore document scoping for this question.
+
+    Rationale: If the question references a policy different from the currently processed
+    document (e.g., mentions another policy name), the scoped vector search will miss.
+
+    Simple heuristic rules (cheap, no extra DB hits):
+    1. If no doc filename -> cannot mismatch.
+    2. Extract base name tokens from doc filename (strip extension, split on non-letters).
+    3. If question contains the word 'policy' and none of the meaningful base tokens (len>=5)
+       appear in the question (case-insensitive), treat as mismatch.
+    4. Additionally, if question contains a multi-word phrase ending with 'policy' whose
+       first word is not among doc tokens, treat as mismatch.
+    This keeps it conservative; we only expand when clearly divergent.
+    """
+    if not doc_filename:
+        return False
+    ql = question.lower()
+    if 'policy' not in ql:
+        return False  # generic question likely fine within scope
+    base = doc_filename.rsplit('.', 1)[0].lower()
+    # Tokenize base filename
+    base_tokens = [t for t in re.split(r"[^a-zA-Z]+", base) if len(t) >= 5]
+    if base_tokens and any(bt in ql for bt in base_tokens):
+        return False  # at least one significant token matches
+    # Look for a phrase ending with 'policy'
+    m = re.search(r"([a-z][a-z\s]{3,}?)policy", ql)
+    if m:
+        phrase = m.group(1).strip()
+        # If phrase first token (>=4 chars) not in base tokens -> mismatch
+        first = phrase.split()[0] if phrase else ''
+        if len(first) >= 4 and first not in base_tokens:
+            return True
+    # Default: if we reached here and no overlap, treat as mismatch
+    return True
+
+
 def _clean_answer_text(text: str) -> str:
-    """Normalize model output to a single-line plain sentence without bullets or markdown."""
+    """Normalize model output while preserving structure for elaborate responses."""
     if not text:
         return ""
-    # Replace line breaks with spaces
-    cleaned = re.sub(r"[\r\n]+", " ", text)
-    # Remove common markdown/list markers and excessive punctuation spacing
-    cleaned = re.sub(r"\s*([*•\-]+)\s+", " ", cleaned)
-    # Remove ordered list markers like "1. ", "2) " at word boundaries
-    cleaned = re.sub(r"(?:(?<=\s)|^)(\d+\.|\d+\))\s+", "", cleaned)
-    # Strip backticks and hash headers
-    cleaned = cleaned.replace("`", "").replace("#", "")
-    # Collapse multiple spaces
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    
+    # Remove all markdown formatting
+    cleaned = text
+    
+    # Remove bold markers (**text**)
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    
+    # Remove italic markers (*text*)
+    cleaned = re.sub(r"\*(.*?)\*", r"\1", cleaned)
+    
+    # Remove bullet point markers (* • -)
+    cleaned = re.sub(r"^\s*[*•\-]\s*", "", cleaned, flags=re.MULTILINE)
+    
+    # Remove excessive bullet point markers in middle of lines
+    cleaned = re.sub(r"\s*[*•\-]{2,}\s*", " ", cleaned)
+    
+    # Remove hash headers (# ## ###)
+    cleaned = re.sub(r"^#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
+    
+    # Remove backticks for code formatting
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    
+    # Clean up excessive whitespace and line breaks
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+    cleaned = re.sub(r"\n ", "\n", cleaned)
+    
+    # Clean up ordered list markers - keep single ones but remove excessive
+    cleaned = re.sub(r"(\d+\.)\s*(\d+\.)\s*", r"\1 ", cleaned)
+    
     return cleaned.strip()
 
 
@@ -207,7 +232,7 @@ def get_chat_model():
     if _chat_model is None:
         try:
             vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"), location=os.getenv("GOOGLE_CLOUD_REGION"))
-            models_to_try = ["gemini-2.5-flash-lite"]
+            models_to_try = ["gemini-2.5-pro"]
             for model_name in models_to_try:
                 try:
                     _chat_model = GenerativeModel(model_name)
@@ -220,10 +245,10 @@ def get_chat_model():
 
 
 _GENERATION_CONFIG = {
-    "temperature": float(os.getenv("GEN_TEMPERATURE", "0.2")),  # slight creativity for fuller justification
-    "top_p": float(os.getenv("GEN_TOP_P", "0.85")),
-    "top_k": int(os.getenv("GEN_TOP_K", "20")),
-    "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", "512")),
+    "temperature": float(os.getenv("GEN_TEMPERATURE", "0.6")),  # increased creativity for more elaborate responses
+    "top_p": float(os.getenv("GEN_TOP_P", "0.9")),
+    "top_k": int(os.getenv("GEN_TOP_K", "40")),
+    "max_output_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", "2048")),  # doubled for more elaborate responses
 }
 
 def _generate_answer(prompt: str) -> str:
@@ -253,6 +278,19 @@ def extract_pdf_text(blob_url):
         return text.strip()
         
     except Exception as e:
+        return None
+
+def extract_pdf_text_from_path(file_path: str) -> str | None:
+    """Extract text from a local PDF file path."""
+    try:
+        with open(file_path, "rb") as f:
+            pdf_reader = PyPDF2.PdfReader(f)
+            text = ""
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                text += (page_text or "") + "\n"
+            return text.strip()
+    except Exception:
         return None
 
 def chunk_text(text, chunk_size=1000, overlap=150):
@@ -521,49 +559,7 @@ def store_document_with_chunks(file_name, full_text, blob_url, chunks_with_embed
     except Exception as e:
         return False
 
-async def _async_hackrx_job(job_id: str, documents: str, questions: list[str]):
-    """Background job that processes a document and answers questions, updating progress."""
-    try:
-        _set_progress(job_id, status="running", percent=1, stage="starting")
 
-        # Step 1: Process the document
-        _set_progress(job_id, percent=10, stage="processing_document")
-        blob_request = BlobUrlRequest(blob_url=documents)
-        process_result = await process_blob_document(blob_request)
-        _set_progress(job_id, percent=60, stage="document_processed", doc=process_result.get("filename"))
-
-        # Step 2: Answer all questions
-        answers: list[str] = []
-        total = max(1, len(questions))
-        for i, question in enumerate(questions):
-            _set_progress(job_id, percent=60 + int((i / total) * 40), stage="answering", current=i+1, total=total)
-            chat_request = ChatRequest(question=question, limit=3)
-            chat_result = await chat_with_documents(chat_request)
-            answers.append(chat_result.get("answer", ""))
-            await asyncio.sleep(0)  # yield control
-
-        result = {
-            "answers": answers,
-            "document_processed": process_result.get("filename"),
-            "total_questions": len(questions),
-            "total_chunks": process_result.get("total_chunks", 0)
-        }
-        _set_progress(job_id, status="completed", percent=100, stage="done", result=result)
-
-    except Exception as e:
-        _set_progress(job_id, status="failed", percent=100, stage="error", error=str(e))
-
-def _run_hackrx_job(job_id: str, payload: dict):
-    """Run the async job in a fresh event loop (for BackgroundTasks)."""
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_async_hackrx_job(job_id, payload["documents"], payload["questions"]))
-    finally:
-        try:
-            loop.close()
-        except Exception:
-            pass
 
 def _setup_neo4j_core(force: bool = False):
     """Core logic to ensure the vector index exists. Returns a status dict."""
@@ -625,25 +621,42 @@ async def process_blob_document(request: BlobUrlRequest):
     4. Store in Neo4j with Document->Chunk structure
     """
     try:
+        print(f"\n{'='*60}")
+        print(f"🚀 Starting document processing...")
+        print(f"{'='*60}")
         
         # Extract filename from URL
         parsed_url = urlparse(request.blob_url)
         file_name = parsed_url.path.split('/')[-1] or "unknown_document.pdf"
+        print(f"📄 Filename: {file_name}")
         
         # Step 1: Download PDF and extract text
+        print(f"⬇️  Step 1: Downloading and extracting PDF text...")
+        start_time = time.time()
         full_text = extract_pdf_text(request.blob_url)
         if not full_text:
             raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
+        print(f"   ✅ Text extracted: {len(full_text)} characters in {time.time() - start_time:.2f}s")
 
         # Step 2: Split text into token-based chunks to reduce 429/quota risk
+        print(f"✂️  Step 2: Splitting text into chunks...")
+        start_time = time.time()
         chunks = chunk_text_tokens(full_text)
+        print(f"   ✅ Created {len(chunks)} chunks in {time.time() - start_time:.2f}s")
+        print(f"   ✅ Created {len(chunks)} chunks in {time.time() - start_time:.2f}s")
         
         # Step 3: Generate embeddings for each chunk with robust retry logic
+        print(f"🧠 Step 3: Generating embeddings for {len(chunks)} chunks...")
+        print(f"   ⚠️  This may take a while depending on API rate limits...")
+        overall_start = time.time()
         
         chunks_with_embeddings = []
+        successful_count = 0
+        failed_count = 0
         
         for i, chunk in enumerate(chunks):
-            
+            chunk_start = time.time()
+            print(f"   📊 Processing chunk {i+1}/{len(chunks)}...", end=" ", flush=True)
             
             # Try to generate embedding with multiple attempts for this specific chunk
             embedding = None
@@ -659,12 +672,15 @@ async def process_blob_document(request: BlobUrlRequest):
                 if embedding is None and chunk_attempts < max_chunk_attempts:
                     # Wait longer for chunk-level retries
                     wait_time = 10 + (chunk_attempts * 5)  # 15s, 20s for chunk retries
+                    print(f"⚠️  Retry {chunk_attempts}, waiting {wait_time}s...", end=" ", flush=True)
                     time.sleep(wait_time)
             
             if embedding is None:
-                pass
+                failed_count += 1
+                print(f"❌ FAILED after {time.time() - chunk_start:.2f}s")
             else:
-                pass
+                successful_count += 1
+                print(f"✅ Success in {time.time() - chunk_start:.2f}s")
             
             chunks_with_embeddings.append({
                 'text': chunk['text'],
@@ -676,14 +692,29 @@ async def process_blob_document(request: BlobUrlRequest):
             
             # No fixed delay between chunks; backoff occurs only on failures/rate limits
         
+        print(f"   ✅ Embeddings complete: {successful_count} successful, {failed_count} failed")
+        print(f"   ⏱️  Total embedding time: {time.time() - overall_start:.2f}s")
+        
         # Step 4: Store in Neo4j with proper graph structure
+        print(f"💾 Step 4: Storing document and chunks in Neo4j...")
+        start_time = time.time()
         success = store_document_with_chunks(file_name, full_text, request.blob_url, chunks_with_embeddings)
         
         if not success:
             raise HTTPException(status_code=500, detail="Failed to store document in Neo4j")
         
+        print(f"   ✅ Stored in Neo4j in {time.time() - start_time:.2f}s")
+        
         # Count successful embeddings
         successful_embeddings = sum(1 for chunk in chunks_with_embeddings if chunk['embedding'] is not None)
+        
+        print(f"\n{'='*60}")
+        print(f"✨ PROCESSING COMPLETE!")
+        print(f"   📄 Filename: {file_name}")
+        print(f"   📊 Total chunks: {len(chunks)}")
+        print(f"   ✅ Successful embeddings: {successful_embeddings}")
+        print(f"   ❌ Failed embeddings: {len(chunks) - successful_embeddings}")
+        print(f"{'='*60}\n")
         
         return {
             "status": "success",
@@ -699,6 +730,238 @@ async def process_blob_document(request: BlobUrlRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
+
+@router.post("/upload-file")
+async def upload_file_document(file: UploadFile = File(...)):
+    """
+    Upload and process a PDF file directly through the interface.
+    Accepts multipart file upload and processes it similar to blob processing.
+    """
+    try:
+        print(f"\n{'='*60}")
+        print(f"📤 Starting file upload processing...")
+        print(f"{'='*60}")
+        
+        # Validate file type
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+        print(f"📄 Filename: {file.filename}")
+        
+        # Read file content with size limit (10MB max)
+        print(f"📥 Reading uploaded file...")
+        start_time = time.time()
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+        file_content = await file.read()
+        
+        if len(file_content) == 0:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        if len(file_content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB")
+        
+        print(f"   ✅ File read: {len(file_content)} bytes in {time.time() - start_time:.2f}s")
+        
+        if file.content_type and not file.content_type.startswith('application/pdf'):
+            # Allow common PDF MIME types
+            if file.content_type not in ['application/pdf', 'application/x-pdf', 'application/acrobat', 'applications/vnd.pdf', 'text/pdf', 'text/x-pdf']:
+                raise HTTPException(status_code=400, detail="Invalid file type. Only PDF files are allowed")
+        
+        # Extract text from PDF content
+        print(f"📖 Extracting text from PDF...")
+        start_time = time.time()
+        try:
+            pdf_file = io.BytesIO(file_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            full_text = ""
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                full_text += (page_text or "") + "\n"
+            
+            full_text = full_text.strip()
+            if not full_text:
+                raise HTTPException(status_code=400, detail="No text content found in PDF")
+                
+        except Exception as pdf_error:
+            raise HTTPException(status_code=400, detail=f"Failed to process PDF: {str(pdf_error)}")
+
+        print(f"   ✅ Text extracted: {len(full_text)} characters in {time.time() - start_time:.2f}s")
+
+        # Generate a clean filename
+        file_name = file.filename or "uploaded_document.pdf"
+        
+        # Step 2: Split text into token-based chunks
+        print(f"✂️  Splitting text into chunks...")
+        start_time = time.time()
+        chunks = chunk_text_tokens(full_text)
+        print(f"   ✅ Created {len(chunks)} chunks in {time.time() - start_time:.2f}s")
+        
+        # Step 3: Generate embeddings for each chunk
+        print(f"🧠 Generating embeddings for {len(chunks)} chunks...")
+        print(f"   ⚠️  This may take a while depending on API rate limits...")
+        overall_start = time.time()
+        chunks_with_embeddings = []
+        successful_count = 0
+        failed_count = 0
+        
+        for i, chunk in enumerate(chunks):
+            chunk_start = time.time()
+            print(f"   📊 Processing chunk {i+1}/{len(chunks)}...", end=" ", flush=True)
+            
+            # Try to generate embedding with retry logic
+            embedding = None
+            chunk_attempts = 0
+            max_chunk_attempts = 5
+            
+            while embedding is None and chunk_attempts < max_chunk_attempts:
+                chunk_attempts += 1
+                embedding = generate_embeddings(chunk['text'])
+                
+                if embedding is None and chunk_attempts < max_chunk_attempts:
+                    wait_time = 10 + (chunk_attempts * 5)
+                    print(f"⚠️  Retry {chunk_attempts}, waiting {wait_time}s...", end=" ", flush=True)
+                    time.sleep(wait_time)
+            
+            if embedding is None:
+                failed_count += 1
+                print(f"❌ FAILED after {time.time() - chunk_start:.2f}s")
+            else:
+                successful_count += 1
+                print(f"✅ Success in {time.time() - chunk_start:.2f}s")
+            
+            chunks_with_embeddings.append({
+                'text': chunk['text'],
+                'chunk_index': chunk['chunk_index'],
+                'start_pos': chunk['start_pos'],
+                'end_pos': chunk['end_pos'],
+                'embedding': embedding
+            })
+        
+        print(f"   ✅ Embeddings complete: {successful_count} successful, {failed_count} failed")
+        print(f"   ⏱️  Total embedding time: {time.time() - overall_start:.2f}s")
+        
+        # Step 4: Store in Neo4j with file:// URL
+        print(f"💾 Storing document and chunks in Neo4j...")
+        start_time = time.time()
+        file_url = f"file://uploaded/{file_name}"
+        success = store_document_with_chunks(file_name, full_text, file_url, chunks_with_embeddings)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to store document in Neo4j")
+        
+        print(f"   ✅ Stored in Neo4j in {time.time() - start_time:.2f}s")
+        
+        # Count successful embeddings
+        successful_embeddings = sum(1 for chunk in chunks_with_embeddings if chunk['embedding'] is not None)
+        
+        print(f"\n{'='*60}")
+        print(f"✨ UPLOAD PROCESSING COMPLETE!")
+        print(f"   📄 Filename: {file_name}")
+        print(f"   📊 Total chunks: {len(chunks)}")
+        print(f"   ✅ Successful embeddings: {successful_embeddings}")
+        print(f"   ❌ Failed embeddings: {len(chunks) - successful_embeddings}")
+        print(f"{'='*60}\n")
+        
+        return {
+            "status": "success",
+            "message": "File uploaded and processed successfully",
+            "filename": file_name,
+            "file_size": len(file_content),
+            "full_text_length": len(full_text),
+            "total_chunks": len(chunks),
+            "chunks_with_embeddings": successful_embeddings,
+            "file_url": file_url
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload and process file: {str(e)}")
+
+@router.post("/process-documents-folder")
+async def process_documents_folder(force: bool = False, limit: int | None = None):
+    """Ingest all local PDFs from the documents folder into Neo4j.
+
+    - force=true will re-embed even if the document already exists in DB.
+    - limit can restrict how many files to process in one call.
+    """
+    base_dir = os.path.abspath(DOCUMENTS_DIR)
+    if not os.path.isdir(base_dir):
+        raise HTTPException(status_code=400, detail=f"documents folder not found: {base_dir}")
+
+    # Gather PDF files
+    all_files = [f for f in os.listdir(base_dir) if f.lower().endswith(".pdf")]
+    if limit is not None and limit > -1:
+        all_files = all_files[:limit]
+
+    processed = []
+    skipped = []
+    failed = []
+
+    try:
+        with neo4j_driver.session() as session:
+            for fname in all_files:
+                # Skip if already present (unless force)
+                if not force:
+                    rec = session.run(
+                        """
+                        MATCH (d:Document {filename: $filename})-[:HAS_CHUNK]->(c:Chunk)
+                        RETURN count(c) as chunk_count
+                        """,
+                        filename=fname,
+                    ).single()
+                    if rec and rec["chunk_count"] and rec["chunk_count"] > 0:
+                        skipped.append({"filename": fname, "reason": "already embedded"})
+                        continue
+
+                fpath = os.path.join(base_dir, fname)
+                text = extract_pdf_text_from_path(fpath)
+                if not text:
+                    failed.append({"filename": fname, "reason": "text extraction failed"})
+                    continue
+
+                chunks = chunk_text_tokens(text)
+                chunks_with_embeddings = []
+                for ch in chunks:
+                    emb = generate_embeddings(ch['text'])
+                    chunks_with_embeddings.append({
+                        'text': ch['text'],
+                        'chunk_index': ch['chunk_index'],
+                        'start_pos': ch['start_pos'],
+                        'end_pos': ch['end_pos'],
+                        'embedding': emb,
+                    })
+
+                ok = store_document_with_chunks(
+                    file_name=fname,
+                    full_text=text,
+                    blob_url=f"file://{fpath}",
+                    chunks_with_embeddings=chunks_with_embeddings,
+                )
+                if ok:
+                    processed.append({
+                        "filename": fname,
+                        "total_chunks": len(chunks),
+                        "embedded": sum(1 for c in chunks_with_embeddings if c['embedding'] is not None),
+                    })
+                else:
+                    failed.append({"filename": fname, "reason": "neo4j storage failed"})
+
+        return {
+            "status": "success",
+            "folder": base_dir,
+            "processed_count": len(processed),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+            "processed": processed,
+            "skipped": skipped,
+            "failed": failed,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Folder ingest failed: {str(e)}")
 
 @router.post("/chat")
 async def chat_with_documents(request: ChatRequest):
@@ -775,30 +1038,32 @@ async def chat_with_documents(request: ChatRequest):
 
         # Step 4: Create detailed prompt for Gemini
         context_string = "\n\n".join(context_parts)
-        prompt = f"""You are a precise insurance policy QA assistant. Use ONLY the facts inside DOCUMENT CONTEXT to answer USER QUESTION.
-If the exact answer is present, write a concise factual justification sentence. If NOT present, output exactly: Information not found in the provided document.
+        prompt = f"""You are a comprehensive document assistant with deep expertise in document analysis. Your task is to provide detailed, complete, and well-structured responses based on the document context provided.
 
-Then the system will prepend a Yes/No indicator automatically, so DO NOT add Yes or No yourself.
+CRITICAL INSTRUCTIONS:
+1. Provide a COMPLETE and THOROUGH explanation (aim for 800-1200 words for complex questions)
+2. Cover ALL relevant aspects of the question - do not cut off or truncate your response
+3. Include specific details such as numbers, percentages, definitions, conditions, and examples when available
+4. Explain background context and related concepts to give a full understanding
+5. Structure your response with clear paragraphs and logical flow
+6. Use the exact information from the documents - do not speculate or add information not present
+7. If certain details are not available in the context, clearly state what information is missing
+8. Continue explaining until you've fully addressed the question - DO NOT stop mid-sentence
 
-Strict rules:
-1. One concise sentence (optionally two if a definition plus a numeric fact are both essential).
-2. No lists, bullets, numbering, or markdown.
-3. No speculation or invented numbers.
-4. Preserve all numeric values, durations, percentages verbatim.
-5. Do not mention 'chunk', 'context', or 'document'.
+The system will automatically add a Yes/No prefix, so focus on providing a comprehensive explanation without starting with Yes or No.
 
 DOCUMENT CONTEXT:
 {context_string}
 
 USER QUESTION: {request.question}
 
-Justification sentence:"""
+Provide a detailed, comprehensive, and COMPLETE explanation that thoroughly addresses the question. Ensure your response is not cut off:"""
 
-        # Step 5: Deterministic generation
+        # Step 5: Generate comprehensive response
         answer_text = _generate_answer(prompt)
         if not answer_text:
             answer_text = "Information not found in the provided document."
-        # Enforce single line & terminal period for consistency
+        # Clean and structure the response while preserving detail
         answer_text = _clean_answer_text(answer_text)
         if answer_text and not answer_text.endswith(('.', '!', '?')):
             answer_text += '.'
@@ -895,17 +1160,21 @@ Justification sentence:"""
                     f"[From {c['document_name']}, Chunk {c['chunk_index']}]: {c['chunk_text']}" for c in combined[:40]
                 ]
                 context_string_fb = "\n\n".join(context_parts_fb)
-                prompt_fb = f"""You are a precise insurance policy QA assistant. Use ONLY the facts inside DOCUMENT CONTEXT to answer USER QUESTION.
-If the exact answer is present, write a concise factual justification sentence. If NOT present, output exactly: Information not found in the provided document.
-
-Do NOT add Yes or No yourself.
-
-DOCUMENT CONTEXT:
-{context_string_fb}
-
-USER QUESTION: {request.question}
-
-Justification sentence:"""
+                prompt_fb = (
+                    "You are a comprehensive document assistant with deep expertise in document analysis. "
+                    "Provide detailed, complete, and well-structured responses based on the document context.\n\n"
+                    "CRITICAL INSTRUCTIONS:\n"
+                    "1. Provide a COMPLETE explanation (aim for 800-1200 words for complex topics)\n"
+                    "2. Include specific details, numbers, percentages, conditions, and examples\n"
+                    "3. Cover background context, definitions, and related concepts fully\n"
+                    "4. Structure your response with clear paragraphs and logical flow\n"
+                    "5. Use only facts from the provided context - do not speculate\n"
+                    "6. If information is not available, state: Information not found in the provided document\n"
+                    "7. Continue until you've FULLY addressed the question - do NOT stop mid-sentence\n"
+                    "8. Do NOT add Yes or No yourself\n\n"
+                    f"DOCUMENT CONTEXT:\n{context_string_fb}\n\n"
+                    f"USER QUESTION: {request.question}\n\nDetailed and COMPLETE explanation:"
+                )
                 second = _generate_answer(prompt_fb)
                 second = _clean_answer_text(second)
                 if second and not second.lower().startswith("information not found"):
@@ -922,6 +1191,87 @@ Justification sentence:"""
                     }
                     if si not in sources:
                         sources.append(si)
+
+        # Cross-document fallback: if still not found in a scoped search, try unscoped across all documents
+        if (
+            answer_text.lower().startswith("no. information not found")
+            and request.document_filename
+        ):
+            with neo4j_driver.session() as session:
+                # Broad vector + keyword search without document filter
+                cypher_all = """
+                CALL db.index.vector.queryNodes('chunk_embeddings', $raw_limit, $qemb)
+                YIELD node, score
+                MATCH (d:Document)-[:HAS_CHUNK]->(node)
+                WHERE node.text IS NOT NULL
+                RETURN node.text as chunk_text,
+                       node.chunk_index as chunk_index,
+                       d.filename as document_name,
+                       score as similarity_score
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+                params_all = {
+                    "raw_limit": max(request.limit * 8, 48),
+                    "limit": max(request.limit * 3, 24),
+                    "qemb": question_embedding,
+                }
+                all_result = session.run(cypher_all, **params_all)
+                combined_all: list[dict[str, any]] = []
+                seen_all: set[tuple[str,int]] = set()
+                for rec in all_result:
+                    key = (rec["document_name"], rec["chunk_index"])
+                    if key not in seen_all:
+                        seen_all.add(key)
+                        combined_all.append({
+                            "chunk_text": rec["chunk_text"],
+                            "chunk_index": rec["chunk_index"],
+                            "document_name": rec["document_name"],
+                            "similarity_score": rec["similarity_score"],
+                        })
+                # Keyword expansion unscoped
+                kw_all = _keyword_search(session, _extract_keywords(request.question), None, 30)
+                for ch in kw_all:
+                    key = (ch["document_name"], ch["chunk_index"])
+                    if key not in seen_all:
+                        seen_all.add(key)
+                        combined_all.append(ch)
+            if combined_all:
+                context_parts_all = [
+                    f"[From {c['document_name']}, Chunk {c['chunk_index']}]: {c['chunk_text']}" for c in combined_all[:60]
+                ]
+                context_joined_all = "\n\n".join(context_parts_all)
+                prompt_all = (
+                    "You are a comprehensive document assistant with deep expertise in document analysis. "
+                    "Provide detailed, complete, and well-structured responses based on the document context.\n\n"
+                    "CRITICAL INSTRUCTIONS:\n"
+                    "1. Provide a COMPLETE explanation (aim for 800-1200 words for complex topics)\n"
+                    "2. Include specific details, numbers, percentages, conditions, and examples\n"
+                    "3. Cover background context, definitions, and related concepts fully\n"
+                    "4. Structure your response with clear paragraphs and logical flow\n"
+                    "5. Use only facts from the provided context - do not speculate\n"
+                    "6. If information is not available, state: Information not found in the provided document\n"
+                    "7. Continue until you've FULLY addressed the question - do NOT stop mid-sentence\n"
+                    "8. Do NOT add Yes or No yourself\n\n"
+                    f"DOCUMENT CONTEXT:\n{context_joined_all}\n\n"
+                    f"USER QUESTION: {request.question}\n\nDetailed and COMPLETE explanation:"
+                )
+                third = _generate_answer(prompt_all)
+                third = _clean_answer_text(third)
+                if third and not third.lower().startswith("information not found"):
+                    if not third.endswith((".","!","?")):
+                        third += "."
+                    answer_text = f"Yes. {third}"
+                    # Replace sources with unscoped ones
+                    sources = []
+                    for ch in combined_all[:60]:
+                        si = {
+                            "document_name": ch["document_name"],
+                            "chunk_index": ch["chunk_index"],
+                            "similarity_score": round(ch["similarity_score"], 4),
+                        }
+                        if si not in sources:
+                            sources.append(si)
 
         return {
             "answer": answer_text,
@@ -973,64 +1323,6 @@ async def list_documents():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/hackrx/run")
-async def hackrx_run(request: HackRxRunRequest, _auth: bool = Depends(require_bearer_token)):
-    """
-    HackRx endpoint: Process a document and answer multiple questions
-    """
-    try:
-        # Derive filename for potential reuse optimization
-        parsed_url = urlparse(request.documents)
-        candidate_filename = parsed_url.path.split('/')[-1] or "unknown_document.pdf"
-
-        # Step 1: Reuse existing processed document if already embedded
-        with neo4j_driver.session() as session:
-            doc_check = session.run(
-                """
-                MATCH (d:Document {filename: $filename})-[:HAS_CHUNK]->(c:Chunk)
-                RETURN d.filename as filename, count(c) as chunk_count, d.total_chunks as expected_chunks
-                """,
-                filename=candidate_filename,
-            ).single()
-
-        if doc_check and doc_check["chunk_count"] and doc_check["chunk_count"] > 0:
-            process_result = {
-                "status": "success",
-                "filename": candidate_filename,
-                "total_chunks": doc_check["chunk_count"],
-            }
-        else:
-            blob_request = BlobUrlRequest(blob_url=request.documents)
-            process_result = await process_blob_document(blob_request)
-            if process_result.get("status") != "success":
-                raise HTTPException(status_code=500, detail="Failed to process document")
-
-        # Step 2: Answer all questions deterministically & document-scoped
-        answers: list[str] = []
-        doc_filename = process_result.get("filename")
-        for i, question in enumerate(request.questions):
-            chat_request = ChatRequest(
-                question=question,
-                limit=12,
-                document_filename=doc_filename,
-            )
-            try:
-                chat_result = await chat_with_documents(chat_request)
-                answer = chat_result.get("answer", "No. Information not found in the provided document.")
-            except Exception:
-                answer = "No. Information not found in the provided document."
-            # Already cleaned & prefixed upstream; just ensure single line
-            clean = _clean_answer_text(answer)
-            answers.append(clean if clean else "No. Information not found in the provided document.")
-            if i < len(request.questions) - 1:
-                time.sleep(0.15)  # slight pacing to avoid burst limits
-
-        return {"answers": answers}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"HackRx run failed: {str(e)}")
 
 @router.post("/reset-database")
 async def reset_database():
@@ -1091,28 +1383,6 @@ async def cleanup_database():
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/hackrx/run-async", response_model=HackRxJobStartResponse)
-async def hackrx_run_async(request: HackRxRunRequest, background_tasks: BackgroundTasks):
-    """Start HackRx run in the background and return a job id for progress polling."""
-    job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "status": "queued",
-        "percent": 0,
-        "stage": "queued",
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
-    background_tasks.add_task(_run_hackrx_job, job_id, request.model_dump())
-    return HackRxJobStartResponse(job_id=job_id, status_url=f"/blob/hackrx/status/{job_id}")
-
-@router.get("/hackrx/status/{job_id}")
-async def hackrx_status(job_id: str):
-    """Get status/progress for a background HackRx job."""
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job not found")
-    return job
 
 @router.get("/health")
 async def health_check():

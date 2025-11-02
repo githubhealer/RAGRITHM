@@ -47,11 +47,15 @@ export type DocumentsResponse = {
   total_documents: number
 }
 
-export type HackRxRunResponse = {
-  answers: string[]
-  document_processed: string
-  total_questions: number
+export type FileUploadResponse = {
+  status: string
+  message: string
+  filename: string
+  file_size: number
+  full_text_length: number
   total_chunks: number
+  chunks_with_embeddings: number
+  file_url: string
 }
 
 export const api = {
@@ -62,6 +66,15 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ blob_url })
   })),
+  uploadFile: async (file: File): Promise<FileUploadResponse> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const response = await fetch(`${API_BASE}/blob/upload-file`, {
+      method: 'POST',
+      body: formData
+    })
+    return json<FileUploadResponse>(response)
+  },
   chat: async (question: string, limit = 5): Promise<ChatResponse> => json<ChatResponse>(await fetch(`${API_BASE}/blob/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -69,10 +82,5 @@ export const api = {
   })),
   documents: async (): Promise<DocumentsResponse> => json<DocumentsResponse>(await fetch(`${API_BASE}/blob/documents`)),
   resetDb: async (): Promise<SimpleStatus> => json<SimpleStatus>(await fetch(`${API_BASE}/blob/reset-database`, { method: 'POST' })),
-  cleanup: async (): Promise<SimpleStatus> => json<SimpleStatus>(await fetch(`${API_BASE}/blob/cleanup`, { method: 'POST' })),
-  hackrxRun: async (documents: string, questions: string[]): Promise<HackRxRunResponse> => json<HackRxRunResponse>(await fetch(`${API_BASE}/hackrx/run`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ documents, questions })
-  }))
+  cleanup: async (): Promise<SimpleStatus> => json<SimpleStatus>(await fetch(`${API_BASE}/blob/cleanup`, { method: 'POST' }))
 }
